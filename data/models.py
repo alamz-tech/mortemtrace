@@ -119,6 +119,10 @@ class Customer(BaseModel):
     name: str
     sla_terms: SlaTerms
     data_region: str
+    services_subscribed: list[str] = Field(default_factory=list)
+    """Which services this customer depends on - lets Exposure (Finance)
+    cross-reference Classification.services against customers without
+    ever reading Timeline or raw_evidence (its scope denies both)."""
 
 
 class Incident(BaseModel):
