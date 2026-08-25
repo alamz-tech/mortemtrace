@@ -25,6 +25,20 @@ def fake_db():
     scope_store.set_client(None)  # force re-creation next test, avoid cross-test leakage
 
 
+@pytest.fixture
+def clean_coordinator():
+    """Coordinator's worker registry is process-global (workers
+    self-register at import time in the real app). Tests that register
+    fakes must not leak them into other tests."""
+    from agents.coordinator import coordinator
+
+    saved = dict(coordinator._WORKERS)
+    coordinator._WORKERS.clear()
+    yield coordinator
+    coordinator._WORKERS.clear()
+    coordinator._WORKERS.update(saved)
+
+
 def seed_agent(fake_db: FakeFirestore, agent_name: str, version: str,
                 read_scopes: list[Collection], write_scopes: list[Collection],
                 department: str | None = None) -> None:

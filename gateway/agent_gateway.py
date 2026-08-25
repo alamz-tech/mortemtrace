@@ -35,6 +35,21 @@ from telemetry.otel_setup import model_call as _model_call_span
 logger = logging.getLogger("mortemtrace.gateway")
 
 DEFAULT_MODEL = os.environ.get("MORTEMTRACE_MODEL", "gemini-3.5-flash")
+_LOOP_THRESHOLD = 3
+
+
+class LoopDetected(Exception):
+    """R9: the same (tool_name, args) signature appeared three times in
+    one invocation. Coordinator catches this, quarantines the agent
+    version, and routes the run to dead-letter - it never retries a loop
+    into existing, it terminates it."""
+
+
+@dataclass
+class InvokeResult:
+    text: str
+    tokens_used: int
+    turns: int
 
 
 @dataclass
@@ -116,30 +131,56 @@ def build_agent(
     return agent, outcome
 
 
-def invoke(agent: LlmAgent, prompt: str, *, run_id: str, org_id: str) -> str:
+def invoke(agent: LlmAgent, prompt: str, *, run_id: str, org_id: str) -> InvokeResult:
     """Runs one turn to completion against a throwaway in-memory session.
-    Returns the final response text. Check the InvocationOutcome from
-    build_agent() afterward - a blocked verdict means this text is the
-    canned policy message, not a real model response, and the caller
-    must not treat it as one."""
+    Check the InvocationOutcome from build_agent() afterward - a blocked
+    verdict means the returned text is the canned policy message, not a
+    real model response, and the caller must not treat it as one.
+
+    Raises LoopDetected if the same tool-call signature repeats three
+    times (R9) - Coordinator is expected to catch this specifically and
+    quarantine rather than retry, since retrying a loop just repeats it.
+    """
     model_name = agent.model if isinstance(agent.model, str) else "unknown"
+    seen_signatures: dict[tuple, int] = {}
+    tokens_used = 0
+    turns = 0
+    final_text = ""
+
     with _model_call_span(agent.name, run_id, org_id, model_name):
         runner = InMemoryRunner(agent=agent, app_name="mortemtrace")
         session_id = f"session_{uuid.uuid4().hex[:12]}"
         runner.session_service.create_session_sync(
             app_name="mortemtrace", user_id=org_id, session_id=session_id,
         )
-        final_text = ""
         for event in runner.run(
             user_id=org_id,
             session_id=session_id,
             new_message=genai_types.Content(role="user", parts=[genai_types.Part(text=prompt)]),
         ):
+            turns += 1
+            usage = getattr(event, "usage_metadata", None)
+            if usage is not None and getattr(usage, "total_token_count", None):
+                tokens_used += usage.total_token_count
+
+            for call in event.get_function_calls():
+                signature = (call.name, tuple(sorted((call.args or {}).items())))
+                seen_signatures[signature] = seen_signatures.get(signature, 0) + 1
+                if seen_signatures[signature] >= _LOOP_THRESHOLD:
+                    logger.warning(
+                        "loop detected for %s (run=%s): %s called %d times with identical args",
+                        agent.name, run_id, call.name, seen_signatures[signature],
+                    )
+                    raise LoopDetected(
+                        f"{call.name} repeated {seen_signatures[signature]}x with identical args"
+                    )
+
             if event.is_final_response() and event.content:
                 final_text = "\n".join(
                     p.text for p in event.content.parts if getattr(p, "text", None)
                 )
-    return final_text
+
+    return InvokeResult(text=final_text, tokens_used=tokens_used, turns=turns)
 
 
 def _extract_request_text(llm_request: LlmRequest) -> str:
