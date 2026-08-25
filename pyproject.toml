@@ -1,0 +1,43 @@
+[project]
+name = "mortemtrace"
+version = "0.1.0"
+description = "On-call incident agent fleet: one committed timeline, four departmental scopes enforced at the data layer."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "pydantic>=2.7,<3",
+    "google-adk>=2.7,<3",
+    "google-cloud-firestore>=2.19,<3",
+    "google-cloud-pubsub>=2.23,<3",
+    "google-cloud-aiplatform>=1.70,<2",
+    "google-cloud-logging>=3.11,<4",
+    "google-cloud-trace>=1.14,<2",
+    "google-cloud-modelarmor>=0.7,<1",
+    "opentelemetry-api>=1.27,<2",
+    "opentelemetry-sdk>=1.27,<2",
+    "opentelemetry-exporter-gcp-trace>=1.7,<2",
+    "opentelemetry-instrumentation-fastapi>=0.48b0",
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.30,<1",
+    "python-multipart>=0.0.9",
+    "jinja2>=3.1,<4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9",
+    "pytest-asyncio>=0.24,<1",
+    "httpx>=0.27,<1",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["agents*", "gateway*", "data*", "registry*", "memory*", "telemetry*", "api*", "console*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+asyncio_mode = "auto"

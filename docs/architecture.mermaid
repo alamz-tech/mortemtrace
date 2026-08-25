@@ -1,0 +1,105 @@
+flowchart TB
+    subgraph IN_["Inbound"]
+        AL["Alert payloads<br/>PagerDuty / Datadog schema"]
+        EV["Pasted logs, Slack thread,<br/>dashboard screenshots"]
+        EXT["External feeds<br/>provider status, changelogs, CVE"]
+        SCH["Cloud Scheduler<br/>watcher + stale sweeps"]
+    end
+
+    subgraph EDGE["Ingest"]
+        API["Ingest API<br/>Cloud Run, stateless"]
+    end
+
+    subgraph BUS["Event bus - Pub/Sub"]
+        T1["evidence.received"]
+        T2["evidence.staged"]
+        T3["timeline.committed"]
+        T4["incident.classified"]
+        T5["upstream.matched"]
+        DLQ["dead-letter"]
+    end
+
+    subgraph CORE["Core pipeline - Cloud Run, ADK"]
+        CO["Coordinator<br/>supervisor"]
+        WT["Watcher"]
+        INT["Intake"]
+        LG["Ledger"]
+        DG["Diagnosis"]
+        CL["Classifier"]
+        GD["Guardian"]
+    end
+
+    subgraph DEPT["Departmental fan-out"]
+        PM["Postmortem<br/>Engineering"]
+        CM["Comms<br/>Support"]
+        CP["Compliance<br/>Legal"]
+        EXPO["Exposure<br/>Finance"]
+    end
+
+    subgraph GOV["Governance"]
+        GW["Agent Gateway<br/>sole model path"]
+        MA["Model Armor<br/>injection + secrets + PII"]
+        SC["Scope Store<br/>read + write enforcement"]
+    end
+
+    subgraph STATE["Firestore - tenant-prefixed"]
+        REG["Agent Registry<br/>read + write scopes"]
+        MEM["Memory Bank"]
+        TL["Incident timeline"]
+        RAW["Raw evidence<br/>restricted"]
+        AUD["Audit + traces"]
+    end
+
+    subgraph MODELS["Vertex AI"]
+        GEM["Gemini 3.5"]
+        GMA["Gemma triage"]
+    end
+
+    UI["Operator console<br/>Cloud Run"]
+
+    AL --> API
+    EV --> API
+    API --> T1
+    EXT --> WT
+    SCH --> WT
+    T1 --> CO
+    CO -->|resolve version + scope| REG
+    CO --> INT --> T2 --> LG --> T3
+    T3 --> DG
+    T3 --> CL --> T4
+    WT --> T5 --> DG
+    T3 --> PM
+    T3 --> CM
+    T3 --> CP
+    T3 --> EXPO
+    T4 --> CP
+    CO -.->|pre + post flight| GD
+    GD --> MA
+    INT --> GW
+    LG --> GW
+    DG --> GW
+    CL --> GW
+    PM --> GW
+    CM --> GW
+    CP --> GW
+    EXPO --> GW
+    GW --> MA --> GEM
+    GW -.-> GMA
+    INT --> SC
+    LG --> SC
+    DG --> SC
+    CL --> SC
+    PM --> SC
+    CM --> SC
+    CP --> SC
+    EXPO --> SC
+    SC --> TL
+    SC -->|denies Comms, Compliance, Exposure| RAW
+    CO --> MEM
+    GD --> MEM
+    DG --> MEM
+    CO -->|budget, loop, no-source| DLQ
+    GD --> AUD
+    UI --> TL
+    UI --> AUD
+    UI --> REG
