@@ -14,23 +14,31 @@ invoke(), and returns a RunResult describing what happened.
 
 Workers never touch Pub/Sub directly and never decide *who* consumes
 their output - that is Coordinator's routing table. A worker that wants
-to trigger downstream work says so declaratively via next_event_type/
-next_payload; Coordinator is the only thing that actually publishes.
-This keeps "Coordinator routes events" true in code, not just in the
-architecture doc, and keeps every worker testable as a pure function of
-(claim, envelope) -> RunResult with a fake Firestore client and no
-Pub/Sub involved at all.
+to trigger downstream work says so declaratively via next_events;
+Coordinator is the only thing that actually publishes. This keeps
+"Coordinator routes events" true in code, not just in the architecture
+doc, and keeps every worker testable as a pure function of (claim,
+envelope) -> RunResult with a fake Firestore client and no Pub/Sub
+involved at all.
+
+next_events is a list, not a single optional pair, because one
+invocation can legitimately produce more than one downstream event -
+the clearest case is Watcher, whose sweep must emit a separate
+UpstreamSignalMatched per genuinely affected incident (R3's acceptance
+criterion is that exactly the affected ones fire and the rest stay
+silent, which can be zero, one, or several events from a single run()
+call). Most workers will only ever append zero or one entry.
 """
 from __future__ import annotations
 
 from typing import Literal, Optional, Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from data.models import Envelope, OrgClaim
 
 RunStatus = Literal[
-    "ok",                     # succeeded, may carry a next event to publish
+    "ok",                     # succeeded, may carry next_events to publish
     "blocked",                 # Model Armor blocked input - fail closed, no next event
     "denied",                  # TenantViolation - forged claim, fail closed
     "clarification_needed",    # R1 - confidence too low, exactly one question raised
@@ -39,11 +47,15 @@ RunStatus = Literal[
 ]
 
 
+class NextEvent(BaseModel):
+    topic: str    # Pub/Sub topic name, e.g. "evidence.staged"
+    payload: dict   # already matches that topic's Pydantic schema, serialized
+
+
 class RunResult(BaseModel):
     status: RunStatus
     detail: str = ""
-    next_event_type: Optional[str] = None   # a Pub/Sub topic name, e.g. "evidence.staged"
-    next_payload: Optional[dict] = None       # already matches that topic's Pydantic schema
+    next_events: list[NextEvent] = Field(default_factory=list)
     tokens_used: int = 0
     turns: int = 0
 

@@ -97,8 +97,9 @@ def route(event_type: str, envelope: Envelope, *, publish: Callable[[str, dict],
     for agent_name in agent_names:
         result = dispatch(agent_name, envelope)
         results.append(result)
-        if result.status == "ok" and result.next_event_type and result.next_payload:
-            publish(result.next_event_type, result.next_payload)
+        if result.status == "ok":
+            for next_event in result.next_events:
+                publish(next_event.topic, next_event.payload)
     return results
 
 

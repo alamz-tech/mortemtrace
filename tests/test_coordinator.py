@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from data import scope_store
 from data.models import AgentVersionRecord, Collection, Envelope
-from agents.contracts import RunResult
+from agents.contracts import NextEvent, RunResult
 from agents.coordinator import coordinator
 from registry import registry
 from tests.conftest import TEST_ORG, seed_agent
@@ -154,7 +154,9 @@ def test_route_publishes_declared_next_event(fake_db, clean_coordinator):
     seed_agent(fake_db, "intake", "1.0.0", read_scopes=[], write_scopes=[])
     clean_coordinator.register_worker(
         "intake",
-        lambda claim, env: RunResult(status="ok", next_event_type="evidence.staged", next_payload={"event_id": "evt_1"}),
+        lambda claim, env: RunResult(
+            status="ok", next_events=[NextEvent(topic="evidence.staged", payload={"event_id": "evt_1"})]
+        ),
     )
     published = []
 
