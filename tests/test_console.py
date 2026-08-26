@@ -207,6 +207,30 @@ def test_incident_detail_legal_shows_scope_explanation_when_not_data_touching(cl
     assert resp.text.count("No draft yet.") == 2
 
 
+def test_incident_detail_shows_classification_severity_and_data_touched(client, fake_db):
+    """The classification record was being fetched and passed to the
+    template but never actually rendered anywhere - data_touched is
+    literally what triggers the GDPR clock, so an operator/judge should
+    be able to see the classification itself, not just infer it from
+    the clock's existence."""
+    incident_id = _seed_incident_full(fake_db, data_touched=True, with_clock=True)
+
+    resp = client.get(f"/incidents/{incident_id}", params={"org_id": TEST_ORG})
+    text = resp.text
+
+    assert "sev1" in text
+    assert "data touched" in text
+    assert "customer_pii" in text
+
+
+def test_incident_detail_shows_no_data_touched_when_false(client, fake_db):
+    incident_id = _seed_incident_full(fake_db, data_touched=False, with_clock=False)
+
+    resp = client.get(f"/incidents/{incident_id}", params={"org_id": TEST_ORG})
+
+    assert "no customer data touched" in resp.text
+
+
 def test_incident_detail_gdpr_clock_renders_when_present(client, fake_db):
     incident_id = _seed_incident_full(fake_db, data_touched=True, with_clock=True)
 

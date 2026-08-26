@@ -81,6 +81,7 @@ _TONE_BY_VALUE = {
     "denied": "bad", "deny": "bad", "blocked": "bad", "block": "bad",
     "dead_letter": "bad", "failed": "bad", "quarantined": "bad",
     "rejected": "bad", "missed": "bad",
+    "sev1": "bad", "sev2": "bad", "sev3": "warn", "sev4": "neutral",
 }
 
 otel_setup.init_telemetry("mortemtrace-console")
@@ -261,6 +262,9 @@ def incident_detail(request: Request, incident_id: str, org_id: Optional[str] = 
         hypotheses.sort(key=lambda h: h.get("confidence", 0), reverse=True)
 
         classification = scope_store.try_read(claim, Collection.CLASSIFICATION, incident_id)
+        if classification:
+            classification["_tone_severity"] = _tone(classification.get("severity"))
+            classification["_tone_data_touched"] = "bad" if classification.get("data_touched") else "ok"
 
         drafts = scope_store.try_query(claim, Collection.DRAFTS, filters=[("incident_ref", "==", incident_id)])
         draft_rows = _department_drafts(drafts, classification)

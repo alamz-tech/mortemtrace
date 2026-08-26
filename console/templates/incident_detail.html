@@ -12,6 +12,23 @@
   · services: {{ incident.services_affected|join(", ") if incident.services_affected else "—" }}
 </p>
 
+{% if classification %}
+<div class="card">
+  <h2>Classification</h2>
+  <p>
+    <span class="badge tone-{{ classification._tone_severity }}">{{ classification.severity }}</span>
+    &nbsp;
+    <span class="badge tone-{{ classification._tone_data_touched }}">
+      {{ "data touched" if classification.data_touched else "no customer data touched" }}
+    </span>
+    {% if classification.data_touched and classification.data_categories %}
+      &nbsp;· categories: {{ classification.data_categories|join(", ") }}
+    {% endif %}
+  </p>
+  <p class="muted">services: {{ classification.services|join(", ") if classification.services else "—" }}</p>
+</div>
+{% endif %}
+
 {% if clock %}
 <div class="card">
   <h2>GDPR Article 33 clock</h2>
