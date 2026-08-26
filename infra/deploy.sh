@@ -4,6 +4,10 @@
 # Not run automatically by anything in this repo - review, then run
 # manually: `GOOGLE_CLOUD_PROJECT=mortemtrace-hackathon bash infra/deploy.sh`
 #
+# After the first-ever deploy, also run infra/setup_pubsub_push.sh once
+# to create the real push subscriptions (needs the ingest URL this
+# script produces).
+#
 # min-instances=0 on both services is deliberate, not an oversight: the
 # NFR ("No in-memory state survives a Cloud Run instance") means nothing
 # is lost by scaling to zero between demo runs, and it is what keeps a
@@ -14,14 +18,21 @@
 # older gcloud SDK, so this deploys explicitly instead); APP_MODULE
 # selects which FastAPI app that image's CMD actually serves.
 #
-# The ingest API runs with MORTEMTRACE_SYNC_DISPATCH=1: no separate
-# Pub/Sub-subscriber service exists (or is required by the spec) to
-# consume evidence.staged/timeline.committed/etc downstream - the
-# verified, working end-to-end path is Coordinator's routing table
-# cascading in-process within one request (see api/ingest.py's
-# _route_sync, and tests/test_full_pipeline.py). Without this flag the
-# deployed service would publish evidence.received to a topic with no
-# subscriber and nothing downstream would ever run.
+# The ingest API runs WITHOUT MORTEMTRACE_SYNC_DISPATCH - that flag
+# blocks /ingest's HTTP response on the entire agent cascade (a real bug
+# this deploy script had until this fix: it violates R2's "under 500ms
+# ... never in the request path" outright, confirmed by timing a live
+# request at 60+ seconds with the flag on). Production dispatch is real
+# Pub/Sub: POST /pubsub/push/{event_type} in api/ingest.py is the
+# delivery target infra/setup_pubsub_push.sh's subscriptions point at,
+# one HTTP request per hop, off the original request entirely.
+#
+# MORTEMTRACE_PUSH_AUDIENCE has a chicken-and-egg problem on a service's
+# very first deploy: it needs the service's own URL, which doesn't exist
+# until after that first deploy. Handled below by deploying once, then
+# patching the env var in with the now-known URL via `gcloud run
+# services update` - a no-op on every deploy after the first, since the
+# URL is stable across revisions.
 #
 # MORTEMTRACE_CLAIM_SECRET comes from Secret Manager
 # (mortemtrace-claim-secret), not a plain --set-env-vars value - this is
@@ -65,8 +76,15 @@ gcloud run deploy mortemtrace-ingest-api \
   --allow-unauthenticated \
   --min-instances 0 \
   --port 8080 \
-  --set-env-vars "${COMMON_ENV},APP_MODULE=api.ingest:app,MORTEMTRACE_SYNC_DISPATCH=1" \
+  --set-env-vars "${COMMON_ENV},APP_MODULE=api.ingest:app" \
   --set-secrets "${COMMON_SECRETS}"
+
+INGEST_URL=$(gcloud run services describe mortemtrace-ingest-api \
+  --project "${PROJECT}" --region "${REGION}" --format="value(status.url)")
+echo "Setting MORTEMTRACE_PUSH_AUDIENCE=${INGEST_URL}..."
+gcloud run services update mortemtrace-ingest-api \
+  --project "${PROJECT}" --region "${REGION}" \
+  --update-env-vars "MORTEMTRACE_PUSH_AUDIENCE=${INGEST_URL}" > /dev/null
 
 echo "Deploying mortemtrace-console..."
 gcloud run deploy mortemtrace-console \
@@ -82,3 +100,6 @@ gcloud run deploy mortemtrace-console \
 echo
 echo "Done. Note the two *.run.app URLs above - the demo video needs at least"
 echo "one visible on screen as live Google Cloud proof (SPEC section 9)."
+echo
+echo "If this was mortemtrace-ingest-api's first-ever deploy, now run:"
+echo "  GOOGLE_CLOUD_PROJECT=${PROJECT} bash infra/setup_pubsub_push.sh"

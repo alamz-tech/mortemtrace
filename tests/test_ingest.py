@@ -11,7 +11,9 @@ the pipeline in-process without needing a full registry-seeded chain.
 """
 from __future__ import annotations
 
+import base64
 import io
+import json
 
 import pytest
 from fastapi.testclient import TestClient
@@ -205,6 +207,83 @@ def test_sync_dispatch_cascades_through_multiple_hops(client, monkeypatch, clean
         ("intake", "evidence.received"),
         ("ledger", "evidence.staged"),
     ]
+
+
+def _push_body(payload: dict) -> dict:
+    data = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+    return {"message": {"data": data, "messageId": "1"}, "subscription": "projects/p/subscriptions/s"}
+
+
+def test_pubsub_push_rejects_missing_auth_header(client):
+    resp = client.post("/pubsub/push/evidence.staged", json=_push_body({"run_id": "r", "org_id": TEST_ORG}))
+
+    assert resp.status_code == 401
+
+
+def test_pubsub_push_rejects_invalid_token(client, monkeypatch):
+    monkeypatch.setenv(ingest_module._PUSH_AUDIENCE_ENV, "https://example.run.app")
+
+    resp = client.post(
+        "/pubsub/push/evidence.staged",
+        json=_push_body({"run_id": "r", "org_id": TEST_ORG}),
+        headers={"Authorization": "Bearer not-a-real-token"},
+    )
+
+    assert resp.status_code == 401
+
+
+def test_pubsub_push_dispatches_decoded_message(client, fake_db, monkeypatch, clean_coordinator):
+    """Proves the actual decode-and-dispatch logic, independent of token
+    verification (which test_pubsub_push_rejects_* above already covers) -
+    monkeypatches _verify_push_token to a no-op, same as production code
+    would see a request Pub/Sub itself already authenticated."""
+    monkeypatch.setattr(ingest_module, "_verify_push_token", lambda header: None)
+    seed_agent(fake_db, "coordinator", "1.0.0",
+               read_scopes=[Collection.REGISTRY, Collection.QUARANTINE, Collection.RUNS],
+               write_scopes=[Collection.RUNS, Collection.QUARANTINE])
+    seed_agent(fake_db, "guardian", "1.0.0", read_scopes=[], write_scopes=[Collection.ALERTS])
+    seed_agent(fake_db, "ledger", "1.0.0", read_scopes=[], write_scopes=[])
+    invoked = []
+    clean_coordinator.register_worker(
+        "ledger", lambda claim, envelope: invoked.append(envelope.payload) or RunResult(status="ok")
+    )
+
+    resp = client.post(
+        "/pubsub/push/evidence.staged",
+        json=_push_body({"run_id": "run_push_1", "org_id": TEST_ORG, "incident_ref": "inc_1", "event_id": "evt_1"}),
+        headers={"Authorization": "Bearer whatever"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "processed"
+    assert len(invoked) == 1
+    assert invoked[0]["event_id"] == "evt_1"
+
+
+def test_pubsub_push_drops_undecodable_message_without_erroring(client, monkeypatch):
+    monkeypatch.setattr(ingest_module, "_verify_push_token", lambda header: None)
+
+    resp = client.post(
+        "/pubsub/push/evidence.staged",
+        json={"message": {"data": "not-valid-base64!!!", "messageId": "1"}, "subscription": "s"},
+        headers={"Authorization": "Bearer whatever"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "dropped"
+
+
+def test_pubsub_push_drops_message_missing_run_id(client, monkeypatch):
+    monkeypatch.setattr(ingest_module, "_verify_push_token", lambda header: None)
+
+    resp = client.post(
+        "/pubsub/push/evidence.staged",
+        json=_push_body({"org_id": TEST_ORG}),
+        headers={"Authorization": "Bearer whatever"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "dropped"
 
 
 def test_watcher_sweep_endpoint_correlates_real_seed_data(fake_db, clean_coordinator, monkeypatch):

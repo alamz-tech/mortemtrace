@@ -17,10 +17,13 @@ here and in the implementation report:
         read_scopes:  [] (ingest never reads incident state back)
 
 Dispatch: set MORTEMTRACE_SYNC_DISPATCH=1 to run the whole pipeline
-in-process (local dev / tests, no Pub/Sub subscriber deployed yet);
-leave it unset to publish to the real "evidence.received" Pub/Sub topic
-instead. See _dispatch_evidence_received() - swapping between the two
-is that one env var, not a rewrite.
+in-process (local dev / a quick manual test - never the deployed
+service: it makes /ingest block on the full agent cascade, which
+directly violates R2's "under 500ms... never in the request path").
+Leave it unset in production, which publishes to real Pub/Sub instead -
+POST /pubsub/push/{event_type} below is where each of those hops
+actually lands, one HTTP request per message, which is what makes
+"never in the request path" true rather than aspirational.
 """
 from __future__ import annotations
 
@@ -30,7 +33,9 @@ import logging
 import os
 from typing import Optional
 
-from fastapi import Body, FastAPI, File, Form, UploadFile
+import google.auth.transport.requests
+import google.oauth2.id_token
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
 from google.cloud import pubsub_v1
 
 from agents import wiring
@@ -57,6 +62,7 @@ INGEST_AGENT_VERSION = "1.0.0"
 
 _EVIDENCE_RECEIVED_TOPIC = "evidence.received"
 _SYNC_DISPATCH_ENV = "MORTEMTRACE_SYNC_DISPATCH"
+_PUSH_AUDIENCE_ENV = "MORTEMTRACE_PUSH_AUDIENCE"
 
 # Small images only: base64-encoded straight into RawEvidence.payload as a
 # data: URI. A real deployment would stream the upload to Cloud Storage
@@ -268,3 +274,85 @@ async def watcher_sweep(body: Optional[dict] = Body(default=None)):
 
     detail = results[0].detail if results else "no watcher worker registered"
     return {"run_id": run_id, "org_id": org_id, "detail": detail}
+
+
+def _verify_push_token(authorization_header: Optional[str]) -> None:
+    """Raises HTTPException(401) unless this is a legitimately
+    Pub/Sub-signed push delivery. The service stays --allow-unauthenticated
+    overall (so /ingest, /watcher/sweep, /healthz work for a public demo -
+    Cloud Run's own IAM invoker check is service-wide, not per-route, so
+    it can't protect this one route without blocking the others too).
+    This route verifies the Google-issued OIDC token itself instead of
+    relying on the platform to reject unauthorized callers before they
+    arrive - the standard documented pattern for a public Cloud Run
+    service with one authenticated Pub/Sub push route."""
+    if authorization_header is None or not authorization_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    audience = os.environ.get(_PUSH_AUDIENCE_ENV)
+    if not audience:
+        raise HTTPException(status_code=500, detail=f"{_PUSH_AUDIENCE_ENV} not configured")
+    token = authorization_header[len("Bearer "):]
+    try:
+        google.oauth2.id_token.verify_oauth2_token(
+            token, google.auth.transport.requests.Request(), audience=audience,
+        )
+    except Exception as exc:
+        logger.warning("rejected push delivery with invalid token: %s", exc)
+        raise HTTPException(status_code=401, detail="invalid push token") from exc
+
+
+@app.post("/pubsub/push/{event_type}")
+async def pubsub_push(event_type: str, request: Request):
+    """The real Pub/Sub push delivery target - one HTTP request per
+    message, per hop. This is what makes the deployed service genuinely
+    asynchronous rather than just claiming to be: /ingest (and every
+    other dispatch) publishes and returns immediately, and each
+    downstream agent invocation happens as its own separate delivery
+    here, off the original request entirely (R2: "under 500ms ...
+    never in the request path"). infra/setup_pubsub_subscriptions.py
+    creates one push subscription per topic against this same path,
+    each with a push-auth-service-account so the request carries a
+    token _verify_push_token can check.
+
+    Known limitation, not worked around: Pub/Sub's delivery guarantee
+    is at-least-once, and a duplicate delivery here would re-run a
+    worker (scope_store's idempotency_key covers the write itself, but
+    not a second, wastefully-real Gemini call before that write).
+    Message-level dedup (tracking seen message IDs) is a real
+    "what I'd revisit at scale" item, not implemented here - acceptable
+    at hackathon-demo volume, where duplicate deliveries are rare.
+    """
+    _verify_push_token(request.headers.get("authorization"))
+
+    body = await request.json()
+    message = body.get("message", {})
+    raw_data = message.get("data", "")
+    try:
+        payload = json.loads(base64.b64decode(raw_data).decode("utf-8")) if raw_data else {}
+    except Exception as exc:
+        logger.error("could not decode push message data for topic=%s: %s", event_type, exc)
+        # Ack it anyway (2xx) rather than let Pub/Sub retry something
+        # that can never parse - the subscription's dead-letter policy
+        # is the real safety net for a genuinely malformed message, not
+        # infinite redelivery of one that will never succeed.
+        return {"status": "dropped", "reason": "undecodable message data"}
+
+    run_id = payload.get("run_id")
+    org_id = payload.get("org_id")
+    if not run_id or not org_id:
+        logger.error("push message for topic=%s missing run_id/org_id: %r", event_type, payload)
+        return {"status": "dropped", "reason": "missing run_id/org_id"}
+
+    incident_id = payload.get("incident_id") or payload.get("incident_ref")
+    claim = _ingest_claim(org_id, run_id)
+    envelope = Envelope(
+        run_id=run_id, org_id=org_id, incident_id=incident_id, claim=claim,
+        event_type=event_type, payload=payload,
+    )
+    with otel_setup.span(
+        "mortemtrace.api", "pubsub_push", run_id=run_id, org_id=org_id,
+        incident_id=incident_id, event_type=event_type,
+    ):
+        coordinator.route(event_type, envelope, publish=_publish)
+
+    return {"status": "processed"}

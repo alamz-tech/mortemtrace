@@ -10,7 +10,8 @@ definition you run deliberately.
 | `init_firestore.py` | `python -m infra.init_firestore` | Bootstraps the agent registry: platform-admin via the unauthenticated bootstrap path, then every other agent via the real authenticated `registry.publish()` path. Idempotent. |
 | `seed_data.py` | `python -m infra.seed_data` | Thin wrapper around `seed/generate.py` - writes synthetic services, customers, incidents, evidence, and a committed timeline under the demo org. Idempotent (deterministic doc IDs). |
 | `firestore.indexes.json` | `gcloud firestore indexes composite create --help` / deployed via `gcloud firestore deploy` conventions | The one composite index this codebase's landed queries actually require today (see below). |
-| `deploy.sh` | not run by this task - review then run manually | `gcloud run deploy` for the ingest API and console, `min-instances=0`. |
+| `deploy.sh` | not run by this task - review then run manually | `gcloud run deploy` for the ingest API and console, `min-instances=0`. Ingest runs real async dispatch (no `MORTEMTRACE_SYNC_DISPATCH`); sets `MORTEMTRACE_PUSH_AUDIENCE` from the service's own URL after the first deploy. |
+| `setup_pubsub_push.sh` | run once, after `deploy.sh`'s first-ever ingest-api deploy | Creates the Pub/Sub push-authenticator service account and one push subscription per topic (excluding `dead-letter`), each pointing at `POST /pubsub/push/{event_type}` - this is what makes production dispatch actually asynchronous rather than blocking the request. |
 | `schedule.sh` | not run by this task - review then run manually | Cloud Scheduler job for the periodic Watcher sweep. |
 
 ## Firestore composite indexes
