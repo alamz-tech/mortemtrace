@@ -33,7 +33,15 @@ GUARDIAN_VERSION = "1.0.0"
 _MAX_TURNS = 20
 _MAX_TOKENS = 200_000
 _MAX_RETRIES = 3
-_BACKOFF_BASE_SECONDS = 1.0
+# 8s base -> backoffs of ~8s, ~16s (~24s total across 2 waits). Widened
+# from an original 1s base (~3s total) after live-testing surfaced real
+# 429 RESOURCE_EXHAUSTED responses from Vertex AI: a per-minute-style
+# quota needs real wall-clock time to reset, and 3s of total backoff
+# never gave it that chance - every retry was hitting the same still-
+# exhausted window. Bounded to stay well under the 60s Pub/Sub
+# ack-deadline (infra/setup_pubsub_push.sh) so this doesn't also trigger
+# a redundant Pub/Sub-level redelivery on top of these retries.
+_BACKOFF_BASE_SECONDS = 8.0
 
 # Worst-first: used to decide whether a new dispatch's status should
 # overwrite the run's recorded status. A run that had one blocked call

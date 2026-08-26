@@ -102,6 +102,49 @@ def test_quarantined_version_short_circuits_without_invoking(fake_db, clean_coor
     assert calls == []  # never invoked
 
 
+def test_transient_failure_retries_then_succeeds(fake_db, clean_coordinator, monkeypatch):
+    """The retry-with-backoff path itself had zero coverage before this -
+    a real gap, given a live 429 RESOURCE_EXHAUSTED from Vertex AI is
+    exactly what this path exists to ride out. monkeypatches time.sleep
+    so the test doesn't actually wait through the real backoff."""
+    sleeps = []
+    monkeypatch.setattr(coordinator.time, "sleep", lambda s: sleeps.append(s))
+    _publish_governance_agents(fake_db)
+    seed_agent(fake_db, "diagnosis", "1.0.0", read_scopes=[], write_scopes=[])
+
+    attempts = []
+
+    def _flaky(claim, env):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise RuntimeError("429 RESOURCE_EXHAUSTED")
+        return RunResult(status="ok")
+
+    clean_coordinator.register_worker("diagnosis", _flaky)
+
+    result = coordinator.dispatch("diagnosis", _envelope())
+
+    assert result.status == "ok"
+    assert len(attempts) == 3
+    assert len(sleeps) == 2  # backoff before attempt 2 and attempt 3, none after the last success
+
+
+def test_retries_exhausted_dead_letters_with_last_error_in_detail(fake_db, clean_coordinator, monkeypatch):
+    monkeypatch.setattr(coordinator.time, "sleep", lambda s: None)
+    _publish_governance_agents(fake_db)
+    seed_agent(fake_db, "diagnosis", "1.0.0", read_scopes=[], write_scopes=[])
+
+    def _always_fails(claim, env):
+        raise RuntimeError("429 RESOURCE_EXHAUSTED")
+
+    clean_coordinator.register_worker("diagnosis", _always_fails)
+
+    result = coordinator.dispatch("diagnosis", _envelope())
+
+    assert result.status == "dead_letter"
+    assert "RESOURCE_EXHAUSTED" in result.detail
+
+
 def test_loop_detected_quarantines_and_dead_letters(fake_db, clean_coordinator):
     from gateway.agent_gateway import LoopDetected
 
