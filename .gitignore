@@ -23,3 +23,7 @@ ui-debug.log
 credentials/
 *.key.json
 service-account*.json
+
+# Explicitly excluded per user request - not part of the submission,
+# staying local until moved out of this folder.
+ENTERPRISE_INTEGRATION_ANALYSIS.md
