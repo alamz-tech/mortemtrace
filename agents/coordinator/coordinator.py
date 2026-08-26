@@ -54,6 +54,12 @@ _ROUTES: dict[str, list[str]] = {
     "timeline.committed": ["diagnosis", "classifier", "postmortem", "comms", "compliance", "exposure"],
     "incident.classified": ["compliance"],
     "upstream.matched": ["diagnosis"],
+    # Cloud Scheduler hits an HTTP endpoint (api/ingest.py's /watcher/sweep),
+    # not a Pub/Sub delivery, but routing it through the same table keeps
+    # Watcher's dispatch - quarantine check, retry/backoff, budget, Guardian
+    # pre/post-flight - identical to every other worker's instead of a
+    # special-cased bypass.
+    "watcher.sweep": ["watcher"],
 }
 
 _WORKERS: dict[str, Callable[[OrgClaim, Envelope], RunResult]] = {}

@@ -1,0 +1,146 @@
+{% extends "base.html" %}
+{% block title %}{{ incident.incident_id }} — MortemTrace{% endblock %}
+{% block content %}
+
+<p><a href="/?org_id={{ org_id }}">&larr; Dashboard</a></p>
+
+<h1 class="mono">{{ incident.incident_id }}</h1>
+<p class="muted">
+  opened {{ incident.opened_at }}
+  {% if incident.resolved_at %} · resolved {{ incident.resolved_at }}{% endif %}
+  · severity {{ incident.severity or "unclassified" }}
+  · services: {{ incident.services_affected|join(", ") if incident.services_affected else "—" }}
+</p>
+
+{% if clock %}
+<div class="card">
+  <h2>GDPR Article 33 clock</h2>
+  <p>
+    <span class="badge tone-{{ clock._tone }}">{{ clock.status }}</span>
+    &nbsp; started {{ clock.gdpr_started_at }} &nbsp;·&nbsp; deadline {{ clock.deadline_at }}
+  </p>
+  <p style="font-size:1.5rem; margin-top:0.5rem;">
+    Time remaining: <span id="gdpr-remaining" class="mono" data-deadline="{{ clock.deadline_at }}">{{ clock_remaining }}</span>
+  </p>
+</div>
+<script>
+(function () {
+  var el = document.getElementById("gdpr-remaining");
+  if (!el) { return; }
+  var deadline = new Date(el.getAttribute("data-deadline"));
+  function tick() {
+    var ms = deadline.getTime() - Date.now();
+    if (ms <= 0) { el.textContent = "deadline passed"; return; }
+    var s = Math.floor(ms / 1000);
+    var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    el.textContent = h + "h " + m + "m " + sec + "s";
+  }
+  tick();
+  setInterval(tick, 1000);
+})();
+</script>
+{% endif %}
+
+<div class="card">
+  <h2>Committed timeline</h2>
+  {% if entries %}
+  <table>
+    <thead><tr><th>Timestamp</th><th>Actor</th><th>Action</th><th>Evidence</th><th>Source event IDs</th></tr></thead>
+    <tbody>
+      {% for e in entries %}
+      <tr>
+        <td class="mono">{{ e.ts }}</td>
+        <td>{{ e.actor }}</td>
+        <td>{{ e.action }}</td>
+        <td>{{ e.evidence }}</td>
+        <td class="source-ids">{% for sid in e.source_event_ids %}<span>{{ sid }}</span>{% endfor %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">No committed timeline entries yet.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Hypotheses</h2>
+  {% if hypotheses %}
+  <table>
+    <thead><tr><th>Statement</th><th>Confidence</th><th>Source event IDs</th><th>Prior incidents cited</th></tr></thead>
+    <tbody>
+      {% for h in hypotheses %}
+      <tr>
+        <td>{{ h.statement }}</td>
+        <td>{{ (h.confidence * 100)|round(0)|int }}%</td>
+        <td class="source-ids">{% for sid in h.source_event_ids %}<span>{{ sid }}</span>{% endfor %}</td>
+        <td>{{ h.prior_incident_refs|join(", ") if h.prior_incident_refs else "—" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">No hypotheses yet.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Departmental drafts</h2>
+  <div class="grid-4">
+    {% for row in draft_rows %}
+    <div class="card" style="margin-bottom:0;">
+      <h3>{{ row.label }}</h3>
+      {% if row.draft %}
+        <p><span class="badge tone-{{ row.draft._tone }}">{{ row.draft.status }}</span></p>
+        <p style="white-space:pre-wrap;">{{ row.draft.body }}</p>
+        {% if row.draft.redaction_note %}<p class="muted">Redacted: {{ row.draft.redaction_note }}</p>{% endif %}
+        <p class="muted">sources: {{ row.draft.source_refs|join(", ") }}</p>
+      {% else %}
+        <p class="empty">{{ row.empty_reason }}</p>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+</div>
+
+<div class="card">
+  <h2>Upstream signals correlated to this incident</h2>
+  {% if signals %}
+  <table>
+    <thead><tr><th>Provider</th><th>Region</th><th>Service</th><th>Severity</th><th>Seen</th></tr></thead>
+    <tbody>
+      {% for s in signals %}
+      <tr><td>{{ s.provider }}</td><td>{{ s.region }}</td><td>{{ s.service }}</td><td>{{ s.severity }}</td><td class="mono">{{ s.seen_at }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">No upstream signals correlated to this incident.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Audit trail</h2>
+  <p class="muted">Entries tied to this incident's own records, plus any deny/block/redact verdict org-wide. Full log: <a href="/audit?org_id={{ org_id }}">/audit</a>.</p>
+  {% if audit_entries %}
+  <table>
+    <thead><tr><th>Verdict</th><th>Actor</th><th>Path</th><th>Reason</th><th>Run</th><th>Timestamp</th></tr></thead>
+    <tbody>
+      {% for a in audit_entries %}
+      <tr class="{{ 'deny-row' if a.verdict != 'allow' else '' }}">
+        <td><span class="badge tone-{{ a._tone }}">{{ a.verdict }}</span></td>
+        <td class="mono">{{ a.actor_agent }}@{{ a.version }}</td>
+        <td class="mono">{{ a.path }}</td>
+        <td>{{ a.reason }}</td>
+        <td class="mono">{{ a.run_id }}</td>
+        <td class="mono">{{ a.ts }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">No audit activity yet.</p>
+  {% endif %}
+</div>
+
+{% endblock %}

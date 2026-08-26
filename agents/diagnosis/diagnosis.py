@@ -100,6 +100,10 @@ def run(claim: OrgClaim, envelope: Envelope) -> RunResult:
 
     source_event_ids = _resolve_source_event_ids(timeline, draft.source_entry_indices)
     if not source_event_ids:
+        logger.warning(
+            "diagnosis for incident %s cited no in-range timeline entry (run=%s); dead-lettering rather than inventing a source",
+            incident_id, claim.run_id,
+        )
         return RunResult(
             status="dead_letter", detail="hypothesis had no traceable source",
             tokens_used=invoked.tokens_used, turns=invoked.turns,
@@ -115,6 +119,10 @@ def run(claim: OrgClaim, envelope: Envelope) -> RunResult:
         prior_incident_refs=draft.prior_incident_refs,
     )
     scope_store.write(claim, Collection.HYPOTHESES, hypothesis.hypothesis_id, hypothesis.model_dump(mode="json"))
+    logger.info(
+        "diagnosis wrote %s for incident %s (confidence=%.2f, prior_incident_refs=%s)",
+        hypothesis.hypothesis_id, incident_id, hypothesis.confidence, hypothesis.prior_incident_refs,
+    )
 
     return RunResult(status="ok", tokens_used=invoked.tokens_used, turns=invoked.turns)
 

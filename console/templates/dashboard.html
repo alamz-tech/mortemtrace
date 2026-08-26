@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — MortemTrace{% endblock %}
+{% block content %}
+<h1>Operator console</h1>
+
+<div class="card">
+  <h2>Active incidents</h2>
+  {% if incidents %}
+  <table>
+    <thead><tr><th>Incident</th><th>Opened</th><th>Severity</th><th>Services affected</th><th>Status</th></tr></thead>
+    <tbody>
+      {% for inc in incidents %}
+      <tr>
+        <td><a class="incident-link mono" href="/incidents/{{ inc.incident_id }}?org_id={{ org_id }}">{{ inc.incident_id }}</a></td>
+        <td class="mono">{{ inc.opened_at }}</td>
+        <td>{{ inc.severity or "—" }}</td>
+        <td>{{ inc.services_affected|join(", ") if inc.services_affected else "—" }}</td>
+        <td><span class="badge tone-{{ inc._tone }}">{{ inc.status }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">No active incidents.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Recent runs <span class="muted" style="font-weight:400; text-transform:none; font-size:0.8rem;">(auto-refreshes every 5s)</span></h2>
+  <table id="runs-table">
+    <thead><tr><th>Run</th><th>Status</th><th>Agents invoked</th><th>Turns</th><th>Tokens</th><th>Updated</th></tr></thead>
+    <tbody>
+      {% for run in runs %}
+      <tr>
+        <td class="mono">{{ run.run_id }}</td>
+        <td><span class="badge tone-{{ run._tone }}">{{ run.status }}</span></td>
+        <td>{{ run.agents_invoked|join(", ") if run.agents_invoked else "—" }}</td>
+        <td>{{ run.turns_used }}</td>
+        <td>{{ run.tokens_used }}</td>
+        <td class="mono">{{ run.updated_at }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="empty">No runs yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<script>
+(function () {
+  var orgId = {{ org_id_json|safe }};
+  var tbody = document.querySelector("#runs-table tbody");
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function render(runs) {
+    if (!runs.length) {
+      tbody.innerHTML = '<tr><td colspan="6" class="empty">No runs yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = runs.map(function (run) {
+      var agents = (run.agents_invoked || []).join(", ") || "—";
+      var tone = run._tone || "neutral";
+      return "<tr>" +
+        '<td class="mono">' + escapeHtml(run.run_id) + "</td>" +
+        '<td><span class="badge tone-' + tone + '">' + escapeHtml(run.status) + "</span></td>" +
+        "<td>" + escapeHtml(agents) + "</td>" +
+        "<td>" + escapeHtml(run.turns_used) + "</td>" +
+        "<td>" + escapeHtml(run.tokens_used) + "</td>" +
+        '<td class="mono">' + escapeHtml(run.updated_at || "") + "</td>" +
+        "</tr>";
+    }).join("");
+  }
+
+  function poll() {
+    fetch("/api/runs?org_id=" + encodeURIComponent(orgId))
+      .then(function (r) { return r.json(); })
+      .then(render)
+      .catch(function () { /* transient poll failure - keep last good state on screen */ });
+  }
+
+  setInterval(poll, 5000);
+})();
+</script>
+{% endblock %}

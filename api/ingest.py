@@ -1,0 +1,270 @@
+"""R1/R2's actual entry point.
+
+A single POST endpoint that validates input minimally, writes one
+RawEvidence doc, resolves/creates the parent Incident, publishes one
+evidence.received message, and returns within the 500ms budget. All real
+extraction/reasoning happens downstream (Intake, via Coordinator) -
+this module never imports Vertex/Gemini and never reasons about
+incident content itself.
+
+Identity: every request mints a fresh "ingest-api" claim via
+scope_store.sign_claim(). This is a registry-scope requirement for
+whoever seeds the agent registry (infra/init_firestore.py) - flagged
+here and in the implementation report:
+
+    ingest-api @ 1.0.0 needs:
+        write_scopes: [Collection.INCIDENTS, Collection.RAW_EVIDENCE]
+        read_scopes:  [] (ingest never reads incident state back)
+
+Dispatch: set MORTEMTRACE_SYNC_DISPATCH=1 to run the whole pipeline
+in-process (local dev / tests, no Pub/Sub subscriber deployed yet);
+leave it unset to publish to the real "evidence.received" Pub/Sub topic
+instead. See _dispatch_evidence_received() - swapping between the two
+is that one env var, not a rewrite.
+"""
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import os
+from typing import Optional
+
+from fastapi import Body, FastAPI, File, Form, UploadFile
+from google.cloud import pubsub_v1
+
+from agents import wiring
+from agents.coordinator import coordinator
+from data import scope_store
+from data.models import (
+    Collection,
+    Envelope,
+    EvidenceKind,
+    EvidenceReceived,
+    Incident,
+    RawEvidence,
+    new_id,
+    now,
+)
+from telemetry import otel_setup
+
+_WATCHER_SWEEP_TOPIC = "watcher.sweep"
+
+logger = logging.getLogger("mortemtrace.api.ingest")
+
+INGEST_AGENT_NAME = "ingest-api"
+INGEST_AGENT_VERSION = "1.0.0"
+
+_EVIDENCE_RECEIVED_TOPIC = "evidence.received"
+_SYNC_DISPATCH_ENV = "MORTEMTRACE_SYNC_DISPATCH"
+
+# Small images only: base64-encoded straight into RawEvidence.payload as a
+# data: URI. A real deployment would stream the upload to Cloud Storage
+# and store a media_uri instead; base64-into-payload is a deliberate
+# hackathon-scope shortcut (documented in the implementation report), not
+# an oversight - it keeps ingest.py free of a second infra dependency
+# (bucket provisioning, signed URLs) for a P0 endpoint that must respond
+# in under 500ms. Truncated rather than rejected past this size so a demo
+# screenshot never turns into a 4xx on stage.
+_MAX_INLINE_FILE_BYTES = 5 * 1024 * 1024  # 5MB
+
+otel_setup.init_telemetry("mortemtrace-ingest-api")
+wiring.register_all()
+
+app = FastAPI(title="MortemTrace Ingest API")
+
+
+# --------------------------------------------------------------------------
+# Dispatch: real Pub/Sub, or synchronous in-process fallback for local/test
+# --------------------------------------------------------------------------
+
+def _sync_dispatch_enabled() -> bool:
+    return os.environ.get(_SYNC_DISPATCH_ENV) == "1"
+
+
+def _publish(topic: str, payload: dict) -> None:
+    """The single publish path for every hop in the chain, not just the
+    first one: this is the exact `publish=` callback Coordinator.route()
+    invokes for *every* worker's declared next_events, at every hop, so
+    branching here on sync-dispatch mode is what makes
+    MORTEMTRACE_SYNC_DISPATCH=1 actually run the whole ingest-to-drafts
+    pipeline in-process rather than only its first hop. Without this
+    branch here specifically, ingest->Intake would run synchronously but
+    Intake's own evidence.staged (and everything after it) would still
+    need a real Pub/Sub subscriber that, per the architecture, nobody
+    has deployed yet - "whole pipeline in-process" would be true only
+    for one hop.
+    """
+    if _sync_dispatch_enabled():
+        _route_sync(topic, payload)
+    else:
+        _publish_pubsub(topic, payload)
+
+
+def _route_sync(topic: str, payload: dict) -> None:
+    """Reconstructs an Envelope from a published payload and dispatches
+    it through Coordinator immediately, recursing into `_publish` again
+    for whatever *that* hop declares next - this is the cascade. The
+    claim minted here is a required Envelope field Coordinator never
+    actually reads (it mints its own coordinator/guardian/worker claims
+    internally for every real read or write), so reusing the ingest
+    identity for it is fine at every hop, not just the first."""
+    run_id = payload.get("run_id")
+    org_id = payload.get("org_id")
+    if not run_id or not org_id:
+        logger.warning(
+            "sync dispatch: payload for topic=%s missing run_id/org_id, dropping: %r", topic, payload,
+        )
+        return
+    incident_id = payload.get("incident_id") or payload.get("incident_ref")
+    claim = _ingest_claim(org_id, run_id)
+    envelope = Envelope(
+        run_id=run_id, org_id=org_id, incident_id=incident_id, claim=claim,
+        event_type=topic, payload=payload,
+    )
+    coordinator.route(topic, envelope, publish=_publish)
+
+
+def _publish_pubsub(topic: str, payload: dict) -> None:
+    """Real Pub/Sub publish. Project comes from GOOGLE_CLOUD_PROJECT;
+    topic path is projects/{project}/topics/{topic}.
+
+    A fresh PublisherClient per call is deliberate, not an oversight: the
+    architecture's stateless-service NFR says nothing survives a Cloud Run
+    instance except the telemetry/gateway singletons that already exist,
+    and this path isn't on the demo's critical path anyway (the README's
+    local/demo flow runs with MORTEMTRACE_SYNC_DISPATCH=1). Pooling the
+    client is a one-line change for whoever wires up the real subscriber.
+    """
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    if not project:
+        logger.warning(
+            "GOOGLE_CLOUD_PROJECT not set; dropping publish to topic=%s payload=%r",
+            topic, payload,
+        )
+        return
+    client = pubsub_v1.PublisherClient()
+    topic_path = client.topic_path(project, topic)
+    data = json.dumps(payload, default=str).encode("utf-8")
+    client.publish(topic_path, data).result(timeout=10)
+
+
+def _dispatch_evidence_received(envelope: Envelope) -> None:
+    """Entry point for the very first hop. Delegates to the same
+    `_publish` path every later hop uses, so all of them - including
+    this one - share one sync-vs-real-Pub/Sub decision point."""
+    _publish(_EVIDENCE_RECEIVED_TOPIC, envelope.payload)
+
+
+def _ingest_claim(org_id: str, run_id: str):
+    return scope_store.sign_claim(
+        org_id=org_id, agent_name=INGEST_AGENT_NAME, agent_version=INGEST_AGENT_VERSION, run_id=run_id,
+    )
+
+
+async def _resolve_payload(payload: Optional[str], file: Optional[UploadFile]) -> str:
+    """Returns the text to store in RawEvidence.payload. Exactly one of
+    `payload` (alert JSON / pasted logs / Slack text) or `file` (a
+    dashboard screenshot) is expected per the request; a screenshot is
+    base64-encoded directly into `payload` as a data: URI rather than
+    written to Cloud Storage - see the module docstring."""
+    if file is not None:
+        raw = await file.read()
+        if len(raw) > _MAX_INLINE_FILE_BYTES:
+            raw = raw[:_MAX_INLINE_FILE_BYTES]
+        encoded = base64.b64encode(raw).decode("ascii")
+        content_type = file.content_type or "application/octet-stream"
+        return f"data:{content_type};base64,{encoded}"
+    return payload or ""
+
+
+# --------------------------------------------------------------------------
+# Routes
+# --------------------------------------------------------------------------
+
+@app.get("/healthz")
+def healthz() -> dict:
+    return {"status": "ok"}
+
+
+@app.post("/ingest")
+async def ingest(
+    org_id: str = Form(...),
+    kind: EvidenceKind = Form(...),
+    incident_id: Optional[str] = Form(None),
+    payload: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+):
+    run_id = new_id("run")
+    with otel_setup.span("mortemtrace.api", "ingest", run_id=run_id, org_id=org_id, incident_id=incident_id) as current_span:
+        claim = _ingest_claim(org_id, run_id)
+
+        if incident_id is None:
+            incident = Incident(incident_id=new_id("inc"), org_id=org_id, opened_at=now(), status="open")
+            scope_store.write(
+                claim, Collection.INCIDENTS, incident.incident_id, incident.model_dump(mode="json"),
+            )
+            incident_id = incident.incident_id
+        # else: reuse the given incident_id as-is. Deliberately no synchronous
+        # existence check here - staying under the 500ms budget matters more
+        # than validating a caller-supplied ID before handing off to Intake.
+        current_span.set_attribute("mortemtrace.incident_id", incident_id)
+
+        body_text = await _resolve_payload(payload, file)
+
+        raw_evidence = RawEvidence(
+            event_id=new_id("eventraw"), org_id=org_id, incident_ref=incident_id,
+            kind=kind, payload=body_text, received_at=now(),
+        )
+        scope_store.write(
+            claim, Collection.RAW_EVIDENCE, raw_evidence.event_id, raw_evidence.model_dump(mode="json"),
+        )
+
+        evidence_received = EvidenceReceived(
+            run_id=claim.run_id, org_id=org_id, incident_ref=incident_id,
+            raw_evidence_id=raw_evidence.event_id, kind=kind, received_at=raw_evidence.received_at,
+        )
+        envelope = Envelope(
+            run_id=claim.run_id, org_id=org_id, incident_id=incident_id, claim=claim,
+            event_type=_EVIDENCE_RECEIVED_TOPIC, payload=evidence_received.model_dump(mode="json"),
+        )
+        _dispatch_evidence_received(envelope)
+
+        return {"run_id": claim.run_id, "incident_id": incident_id}
+
+
+@app.post("/watcher/sweep")
+async def watcher_sweep(body: Optional[dict] = Body(default=None)):
+    """Cloud Scheduler's target (see infra/schedule.sh) for the periodic
+    Watcher sweep (R2, R3). Routed through coordinator.route() exactly
+    like every Pub/Sub-originated event - same quarantine check,
+    retry/backoff, budget enforcement, and Guardian pre/post-flight - so
+    a scheduled trigger isn't a special-cased bypass of any of that.
+
+    Body is optional and JSON: {"org_id": "...", "injected_signal": {...}}.
+    org_id defaults to MORTEMTRACE_DEMO_ORG, matching console/ui.py's
+    convention. injected_signal (a Signal-shaped dict) lets a demo
+    operator force one specific, deterministic correlation live instead
+    of relying on Watcher's mock feed timing (see agents/watcher/
+    watcher.py's module docstring) - this is what makes "inject a
+    provider status degradation" (SPEC section 10, beat 5) an actual
+    button to press rather than a hope that the mock feed cooperates.
+    """
+    body = body or {}
+    org_id = body.get("org_id") or os.environ.get("MORTEMTRACE_DEMO_ORG", "org_demo")
+    run_id = new_id("run")
+
+    with otel_setup.span("mortemtrace.api", "watcher_sweep", run_id=run_id, org_id=org_id):
+        claim = _ingest_claim(org_id, run_id)
+        payload: dict = {}
+        if "injected_signal" in body:
+            payload["injected_signal"] = body["injected_signal"]
+
+        envelope = Envelope(
+            run_id=run_id, org_id=org_id, claim=claim,
+            event_type=_WATCHER_SWEEP_TOPIC, payload=payload,
+        )
+        results = coordinator.route(_WATCHER_SWEEP_TOPIC, envelope, publish=_publish)
+
+    detail = results[0].detail if results else "no watcher worker registered"
+    return {"run_id": run_id, "org_id": org_id, "detail": detail}

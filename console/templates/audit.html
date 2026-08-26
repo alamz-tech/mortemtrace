@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Audit log — MortemTrace{% endblock %}
+{% block content %}
+<h1>Global audit log</h1>
+<p class="muted">Every allow/deny/block/redact verdict recorded by data/scope_store.py, most recent first.</p>
+<div class="card">
+{% if entries %}
+<table>
+  <thead><tr><th>Verdict</th><th>Actor</th><th>Path</th><th>Reason</th><th>Run</th><th>Timestamp</th></tr></thead>
+  <tbody>
+    {% for a in entries %}
+    <tr class="{{ 'deny-row' if a.verdict != 'allow' else '' }}">
+      <td><span class="badge tone-{{ a._tone }}">{{ a.verdict }}</span></td>
+      <td class="mono">{{ a.actor_agent }}@{{ a.version }}</td>
+      <td class="mono">{{ a.path }}</td>
+      <td>{{ a.reason }}</td>
+      <td class="mono">{{ a.run_id }}</td>
+      <td class="mono">{{ a.ts }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No audit entries yet.</p>
+{% endif %}
+</div>
+{% endblock %}
