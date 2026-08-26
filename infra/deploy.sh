@@ -38,16 +38,24 @@
 # GOOGLE_GENAI_USE_VERTEXAI=true and GOOGLE_CLOUD_LOCATION are both
 # required by gateway/agent_gateway.py - see that file's docstring for
 # why (without the first, google-genai silently tries the wrong backend
-# entirely; MORTEMTRACE_MODEL's default was verified against the second).
+# entirely). GOOGLE_CLOUD_LOCATION is deliberately "global", not REGION
+# below - confirmed live that gemini-3.5-flash 404s on every specific
+# region tried but works on the global endpoint (the common rollout
+# pattern for a newly-released model). This is independent of
+# MODEL_ARMOR_LOCATION (gateway/model_armor.py's own default,
+# us-central1) and of REGION (where the Cloud Run *service* itself
+# runs) - three separate location settings, only the Gemini one needed
+# to move to global.
 set -euo pipefail
 
 PROJECT="${GOOGLE_CLOUD_PROJECT:?set GOOGLE_CLOUD_PROJECT}"
 REGION="${MORTEMTRACE_REGION:-us-central1}"
+GEMINI_LOCATION="${MORTEMTRACE_GEMINI_LOCATION:-global}"
 DEMO_ORG="${MORTEMTRACE_DEMO_ORG:-org_demo}"
 CLAIM_SECRET_NAME="${MORTEMTRACE_CLAIM_SECRET_NAME:-mortemtrace-claim-secret}"
 
 COMMON_SECRETS="MORTEMTRACE_CLAIM_SECRET=${CLAIM_SECRET_NAME}:latest"
-COMMON_ENV="GOOGLE_CLOUD_PROJECT=${PROJECT},GOOGLE_CLOUD_LOCATION=${REGION},GOOGLE_GENAI_USE_VERTEXAI=true,MORTEMTRACE_DEMO_ORG=${DEMO_ORG}"
+COMMON_ENV="GOOGLE_CLOUD_PROJECT=${PROJECT},GOOGLE_CLOUD_LOCATION=${GEMINI_LOCATION},GOOGLE_GENAI_USE_VERTEXAI=true,MORTEMTRACE_DEMO_ORG=${DEMO_ORG}"
 
 echo "Deploying mortemtrace-ingest-api..."
 gcloud run deploy mortemtrace-ingest-api \

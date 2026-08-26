@@ -23,18 +23,26 @@ confirmed against this project's actual Vertex AI access, not assumed:
                                      both breaks and is architecturally
                                      wrong per the compliance checklist.
   GOOGLE_CLOUD_PROJECT             - already required elsewhere.
-  GOOGLE_CLOUD_LOCATION=us-central1 - the region DEFAULT_MODEL was
-                                     verified against.
+  GOOGLE_CLOUD_LOCATION=global      - see below for why "global" and not
+                                     a specific region.
 
-DEFAULT_MODEL is "gemini-2.5-flash", not "gemini-3.5-flash" as
-SPEC-postmortem.md's non-goals section states ("Off-the-shelf Gemini 3.5
-and Gemma only") - verified directly against this project's real Vertex
-AI Model Garden access (google.genai.Client(...).models.generate_content
-against a dozen 3.x-family candidate IDs, all 404; 2.5-family IDs work).
-This is a real access/availability gap worth resolving with Google Cloud
-support or a different region before the submission, not a typo to
-silently paper over - flagged here and to the user directly. Override
-via MORTEMTRACE_MODEL if 3.5 access is confirmed working before demo day.
+DEFAULT_MODEL is "gemini-3.5-flash", matching SPEC-postmortem.md's
+non-goals section ("Off-the-shelf Gemini 3.5 and Gemma only"). Getting
+there took two real findings, not one, both confirmed directly against
+this project's live Vertex AI access rather than assumed:
+  1. Every *regional* Vertex AI endpoint tried (us-central1, us-east1,
+     us-east4, us-west1, europe-west1, europe-west4) 404s on every
+     gemini-3.x candidate ID. This looked at first like the project
+     genuinely lacked 3.5 access.
+  2. It doesn't - gemini-3.5-flash works on the *global* endpoint
+     (GOOGLE_CLOUD_LOCATION=global), which is the common rollout pattern
+     for a newly-released Vertex AI model before regional availability
+     catches up. This is independent of MODEL_ARMOR_LOCATION (gateway/
+     model_armor.py), which stays regional (us-central1) - Model Armor
+     and the Gemini model call are two separate location settings, not
+     one, and only the latter needed to move.
+Override via MORTEMTRACE_MODEL/GOOGLE_CLOUD_LOCATION if regional 3.5
+access lands before demo day and you'd rather pin to a specific region.
 """
 from __future__ import annotations
 
@@ -56,7 +64,7 @@ from telemetry.otel_setup import model_call as _model_call_span
 
 logger = logging.getLogger("mortemtrace.gateway")
 
-DEFAULT_MODEL = os.environ.get("MORTEMTRACE_MODEL", "gemini-2.5-flash")
+DEFAULT_MODEL = os.environ.get("MORTEMTRACE_MODEL", "gemini-3.5-flash")
 _LOOP_THRESHOLD = 3
 
 
