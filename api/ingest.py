@@ -27,10 +27,12 @@ actually lands, one HTTP request per message, which is what makes
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
 import os
+import threading
 from typing import Optional
 
 import google.auth.transport.requests
@@ -131,17 +133,32 @@ def _route_sync(topic: str, payload: dict) -> None:
     coordinator.route(topic, envelope, publish=_publish)
 
 
+_PUBSUB_CLIENT: Optional[pubsub_v1.PublisherClient] = None
+_PUBSUB_CLIENT_LOCK = threading.Lock()
+
+
+def _pubsub_client() -> pubsub_v1.PublisherClient:
+    """Cached, not constructed per call. This used to be a fresh
+    PublisherClient (a fresh gRPC channel plus a fresh credential/token
+    exchange) on every single publish - defensible when this path
+    "wasn't on the demo's critical path" under MORTEMTRACE_SYNC_DISPATCH,
+    genuinely wrong now that it's the real production dispatch path for
+    every hop. Caching the client is what an instance's stateless-NFR
+    exemption for "the telemetry/gateway singletons that already exist"
+    was always meant to cover - a connection/credential cache is not
+    per-incident state, the same way data/scope_store.py's own cached
+    Firestore client isn't."""
+    global _PUBSUB_CLIENT
+    if _PUBSUB_CLIENT is None:
+        with _PUBSUB_CLIENT_LOCK:
+            if _PUBSUB_CLIENT is None:
+                _PUBSUB_CLIENT = pubsub_v1.PublisherClient()
+    return _PUBSUB_CLIENT
+
+
 def _publish_pubsub(topic: str, payload: dict) -> None:
     """Real Pub/Sub publish. Project comes from GOOGLE_CLOUD_PROJECT;
-    topic path is projects/{project}/topics/{topic}.
-
-    A fresh PublisherClient per call is deliberate, not an oversight: the
-    architecture's stateless-service NFR says nothing survives a Cloud Run
-    instance except the telemetry/gateway singletons that already exist,
-    and this path isn't on the demo's critical path anyway (the README's
-    local/demo flow runs with MORTEMTRACE_SYNC_DISPATCH=1). Pooling the
-    client is a one-line change for whoever wires up the real subscriber.
-    """
+    topic path is projects/{project}/topics/{topic}."""
     project = os.environ.get("GOOGLE_CLOUD_PROJECT")
     if not project:
         logger.warning(
@@ -149,7 +166,7 @@ def _publish_pubsub(topic: str, payload: dict) -> None:
             topic, payload,
         )
         return
-    client = pubsub_v1.PublisherClient()
+    client = _pubsub_client()
     topic_path = client.topic_path(project, topic)
     data = json.dumps(payload, default=str).encode("utf-8")
     client.publish(topic_path, data).result(timeout=10)
@@ -193,14 +210,18 @@ def healthz() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/ingest")
-async def ingest(
-    org_id: str = Form(...),
-    kind: EvidenceKind = Form(...),
-    incident_id: Optional[str] = Form(None),
-    payload: Optional[str] = Form(None),
-    file: Optional[UploadFile] = File(None),
-):
+def _handle_ingest(org_id: str, kind: EvidenceKind, incident_id: Optional[str], body_text: str) -> dict:
+    """The actual blocking work: Firestore writes and a Pub/Sub publish,
+    all synchronous SDK calls. Split out from the async route below and
+    run via asyncio.to_thread so it can't block FastAPI's event loop -
+    an async def route that calls blocking I/O directly blocks every
+    other concurrent request on the same worker/instance for its
+    duration, which is exactly the kind of thing that reads as "under
+    500ms in isolation" and falls over under any real concurrent load
+    (a demo request landing alongside a Cloud Scheduler sweep, for
+    instance). Caught by timing concurrent requests live, not by any
+    unit test - the TestClient in tests/test_ingest.py runs everything
+    synchronously and has no concurrency to expose this."""
     run_id = new_id("run")
     with otel_setup.span("mortemtrace.api", "ingest", run_id=run_id, org_id=org_id, incident_id=incident_id) as current_span:
         claim = _ingest_claim(org_id, run_id)
@@ -215,8 +236,6 @@ async def ingest(
         # existence check here - staying under the 500ms budget matters more
         # than validating a caller-supplied ID before handing off to Intake.
         current_span.set_attribute("mortemtrace.incident_id", incident_id)
-
-        body_text = await _resolve_payload(payload, file)
 
         raw_evidence = RawEvidence(
             event_id=new_id("eventraw"), org_id=org_id, incident_ref=incident_id,
@@ -239,24 +258,22 @@ async def ingest(
         return {"run_id": claim.run_id, "incident_id": incident_id}
 
 
-@app.post("/watcher/sweep")
-async def watcher_sweep(body: Optional[dict] = Body(default=None)):
-    """Cloud Scheduler's target (see infra/schedule.sh) for the periodic
-    Watcher sweep (R2, R3). Routed through coordinator.route() exactly
-    like every Pub/Sub-originated event - same quarantine check,
-    retry/backoff, budget enforcement, and Guardian pre/post-flight - so
-    a scheduled trigger isn't a special-cased bypass of any of that.
+@app.post("/ingest")
+async def ingest(
+    org_id: str = Form(...),
+    kind: EvidenceKind = Form(...),
+    incident_id: Optional[str] = Form(None),
+    payload: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+):
+    body_text = await _resolve_payload(payload, file)
+    return await asyncio.to_thread(_handle_ingest, org_id, kind, incident_id, body_text)
 
-    Body is optional and JSON: {"org_id": "...", "injected_signal": {...}}.
-    org_id defaults to MORTEMTRACE_DEMO_ORG, matching console/ui.py's
-    convention. injected_signal (a Signal-shaped dict) lets a demo
-    operator force one specific, deterministic correlation live instead
-    of relying on Watcher's mock feed timing (see agents/watcher/
-    watcher.py's module docstring) - this is what makes "inject a
-    provider status degradation" (SPEC section 10, beat 5) an actual
-    button to press rather than a hope that the mock feed cooperates.
-    """
-    body = body or {}
+
+def _handle_watcher_sweep(body: dict) -> dict:
+    """Blocking work (coordinator.route -> Firestore reads/writes, plus
+    a real Gemini call via Diagnosis on any match) - run via
+    asyncio.to_thread, same reasoning as _handle_ingest above."""
     org_id = body.get("org_id") or os.environ.get("MORTEMTRACE_DEMO_ORG", "org_demo")
     run_id = new_id("run")
 
@@ -274,6 +291,26 @@ async def watcher_sweep(body: Optional[dict] = Body(default=None)):
 
     detail = results[0].detail if results else "no watcher worker registered"
     return {"run_id": run_id, "org_id": org_id, "detail": detail}
+
+
+@app.post("/watcher/sweep")
+async def watcher_sweep(body: Optional[dict] = Body(default=None)):
+    """Cloud Scheduler's target (see infra/schedule.sh) for the periodic
+    Watcher sweep (R2, R3). Routed through coordinator.route() exactly
+    like every Pub/Sub-originated event - same quarantine check,
+    retry/backoff, budget enforcement, and Guardian pre/post-flight - so
+    a scheduled trigger isn't a special-cased bypass of any of that.
+
+    Body is optional and JSON: {"org_id": "...", "injected_signal": {...}}.
+    org_id defaults to MORTEMTRACE_DEMO_ORG, matching console/ui.py's
+    convention. injected_signal (a Signal-shaped dict) lets a demo
+    operator force one specific, deterministic correlation live instead
+    of relying on Watcher's mock feed timing (see agents/watcher/
+    watcher.py's module docstring) - this is what makes "inject a
+    provider status degradation" (SPEC section 10, beat 5) an actual
+    button to press rather than a hope that the mock feed cooperates.
+    """
+    return await asyncio.to_thread(_handle_watcher_sweep, body or {})
 
 
 def _verify_push_token(authorization_header: Optional[str]) -> None:
@@ -323,8 +360,16 @@ async def pubsub_push(event_type: str, request: Request):
     at hackathon-demo volume, where duplicate deliveries are rare.
     """
     _verify_push_token(request.headers.get("authorization"))
-
     body = await request.json()
+    return await asyncio.to_thread(_handle_pubsub_push, event_type, body)
+
+
+def _handle_pubsub_push(event_type: str, body: dict) -> dict:
+    """Decode plus the actual dispatch - both fast to write, but
+    coordinator.route() inside is blocking Firestore I/O and, on most
+    hops, a real Gemini call, so this whole thing runs via
+    asyncio.to_thread from the route above rather than directly on the
+    event loop (same reasoning as _handle_ingest)."""
     message = body.get("message", {})
     raw_data = message.get("data", "")
     try:

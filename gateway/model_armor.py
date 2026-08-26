@@ -38,6 +38,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 from typing import Literal, Optional
 
 from pydantic import BaseModel
@@ -131,13 +132,30 @@ def _template_name() -> str:
     return f"projects/{project}/locations/{_LOCATION}/templates/{_TEMPLATE_ID}"
 
 
-def _client():
-    from google.cloud import modelarmor_v1beta
+_CLIENT = None
+_CLIENT_LOCK = threading.Lock()
 
-    api_endpoint = f"modelarmor.{_LOCATION}.rep.googleapis.com"
-    return modelarmor_v1beta.ModelArmorClient(
-        client_options={"api_endpoint": api_endpoint}
-    )
+
+def _client():
+    """Cached, not constructed per call - a fresh ModelArmorClient means a
+    fresh gRPC channel and a fresh credential/token exchange on every
+    single screen_input()/screen_output(), which is called on every
+    agent's every model call. Found this the same way as the ingest
+    latency bug it's a sibling of: timing a live request and seeing
+    seconds where there should have been milliseconds. Matches the
+    caching pattern data/scope_store.py's own _client() already uses -
+    this file just hadn't followed it."""
+    global _CLIENT
+    if _CLIENT is None:
+        with _CLIENT_LOCK:
+            if _CLIENT is None:
+                from google.cloud import modelarmor_v1beta
+
+                api_endpoint = f"modelarmor.{_LOCATION}.rep.googleapis.com"
+                _CLIENT = modelarmor_v1beta.ModelArmorClient(
+                    client_options={"api_endpoint": api_endpoint}
+                )
+    return _CLIENT
 
 
 def screen_input(text: str, *, run_id: str, org_id: str, agent_name: str) -> ArmorResult:
