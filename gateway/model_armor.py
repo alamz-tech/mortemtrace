@@ -4,14 +4,34 @@ to fail the run closed on a block verdict and to redact-and-audit on a
 sensitive-data verdict, on both a live pasted-log injection attempt and a
 leaked API key, on camera.
 
-If the real Model Armor API errors (region/template misconfigured,
-transient outage), this falls back to a local heuristic screener rather
-than either hard-failing the whole run or silently skipping screening -
-the build brief explicitly sanctions this: "If Vertex Model Armor is
-unavailable in your region, use the Guardian agent to implement injection
-and secret screening directly." Every verdict records which path
-produced it, so a fallback screen is never mistaken for the real thing
-in the audit trail.
+Two distinct roles for the local heuristic screener, confirmed by testing
+both live against the real API, not assumed:
+
+1. Exception fallback - if the real Model Armor API errors (region/
+   template misconfigured, transient outage), this runs instead of
+   either hard-failing the whole run or silently skipping screening -
+   the build brief explicitly sanctions this: "If Vertex Model Armor is
+   unavailable in your region, use the Guardian agent to implement
+   injection and secret screening directly."
+2. Always-on supplementary check, even when the real API succeeds. This
+   is not redundant: live-tested against the real API, the configured
+   template's SDP (sensitive-data) filter does not flag a bare
+   `api_key: sk-...`-shaped string - basic_config's preset categories
+   are tuned for standard PII (SSN, credit cards, etc.), not free-form
+   secret tokens, which is a real, narrow gap in Model Armor's default
+   coverage rather than a misconfiguration. screen_output() therefore
+   always runs the local secret patterns on top of whatever Model Armor
+   already found, and merges them, rather than trusting a real "allow"
+   as the final word. screen_input()'s injection filter, by contrast,
+   IS correctly caught by Model Armor once configured with
+   pi_and_jailbreak enabled (confirmed against SPEC R8's exact
+   acceptance-criterion string) - the local check still runs there too,
+   purely as defense in depth, but isn't compensating for a known gap
+   the way the output side is.
+
+Every verdict records which path(s) produced it, so a fallback or
+supplementary screen is never mistaken for the real API's own verdict in
+the audit trail.
 """
 from __future__ import annotations
 
@@ -25,7 +45,7 @@ from pydantic import BaseModel
 logger = logging.getLogger("mortemtrace.model_armor")
 
 Verdict = Literal["allow", "block", "redact"]
-Source = Literal["model_armor", "local_fallback"]
+Source = Literal["model_armor", "local_fallback", "model_armor+local_fallback"]
 
 _TEMPLATE_ID = os.environ.get("MODEL_ARMOR_TEMPLATE_ID", "mortemtrace-guardian")
 _LOCATION = os.environ.get("MODEL_ARMOR_LOCATION", "us-central1")
@@ -79,13 +99,21 @@ def _local_screen_input(text: str) -> ArmorResult:
     return ArmorResult(verdict="allow", reason="local fallback: no injection pattern matched", source="local_fallback")
 
 
-def _local_screen_output(text: str) -> ArmorResult:
+def _redact_secret_patterns(text: str) -> tuple[str, bool]:
+    """Pure redaction pass, shared by _local_screen_output (exception-
+    fallback path) and screen_output's always-on supplementary check
+    (real-API-succeeded path)."""
     redacted = text
     hit = False
     for pattern in _SECRET_PATTERNS:
         if pattern.search(redacted):
             hit = True
             redacted = pattern.sub("[REDACTED]", redacted)
+    return redacted, hit
+
+
+def _local_screen_output(text: str) -> ArmorResult:
+    redacted, hit = _redact_secret_patterns(text)
     if hit:
         return ArmorResult(
             verdict="redact", reason="local fallback: secret-shaped content redacted",
@@ -125,13 +153,26 @@ def screen_input(text: str, *, run_id: str, org_id: str, agent_name: str) -> Arm
             user_prompt_data=modelarmor_v1beta.DataItem(text=text),
         )
         response = client.sanitize_user_prompt(request=request)
-        return _interpret(response.sanitization_result, text, is_input=True)
+        remote = _interpret(response.sanitization_result, text, is_input=True)
     except Exception:
         logger.warning(
             "Model Armor input screen unavailable (agent=%s run=%s), using local fallback",
             agent_name, run_id, exc_info=True,
         )
         return _local_screen_input(text)
+
+    if remote.verdict == "block":
+        return remote
+
+    # Defense in depth, not compensating for a known gap on this side
+    # (unlike screen_output below) - the real API correctly catches the
+    # injection patterns this local check also knows about. Still run it,
+    # since a local block should never be silently overridden by a
+    # remote allow.
+    local = _local_screen_input(text)
+    if local.verdict == "block":
+        return local
+    return remote
 
 
 def screen_output(text: str, *, run_id: str, org_id: str, agent_name: str) -> ArmorResult:
@@ -147,7 +188,7 @@ def screen_output(text: str, *, run_id: str, org_id: str, agent_name: str) -> Ar
             model_response_data=modelarmor_v1beta.DataItem(text=text),
         )
         response = client.sanitize_model_response(request=request)
-        return _interpret(response.sanitization_result, text, is_input=False)
+        remote = _interpret(response.sanitization_result, text, is_input=False)
     except Exception:
         logger.warning(
             "Model Armor output screen unavailable (agent=%s run=%s), using local fallback",
@@ -155,21 +196,88 @@ def screen_output(text: str, *, run_id: str, org_id: str, agent_name: str) -> Ar
         )
         return _local_screen_output(text)
 
+    # Always run the local secret patterns too, on top of whatever the
+    # real API already returned - see module docstring for why this one
+    # (unlike screen_input above) is a real, live-tested gap and not just
+    # extra caution: the configured template's SDP filter does not flag a
+    # bare "api_key: sk-..."-shaped string.
+    base_text = remote.sanitized_text or text
+    redacted_text, local_hit = _redact_secret_patterns(base_text)
+    if not local_hit:
+        return remote
+
+    if remote.verdict == "redact":
+        return ArmorResult(
+            verdict="redact",
+            reason=f"{remote.reason}; local fallback also redacted secret-shaped content",
+            source="model_armor+local_fallback",
+            sanitized_text=redacted_text,
+        )
+    return ArmorResult(
+        verdict="redact",
+        reason="local fallback: secret-shaped content redacted (Model Armor did not flag it)",
+        source="model_armor+local_fallback",
+        sanitized_text=redacted_text,
+    )
+
+
+# filter_results is keyed by these filter names; each value's actual
+# verdict lives in exactly one of these nested fields, and the mapping
+# from key to field name is not a fully regular pattern (malicious_uris
+# -> malicious_uri_filter_result, singular; csam -> csam_filter_filter_result,
+# doubled) - confirmed against a live API response, not guessed.
+_NESTED_RESULT_FIELD_BY_KEY = {
+    "pi_and_jailbreak": "pi_and_jailbreak_filter_result",
+    "sdp": "sdp_filter_result",
+    "malicious_uris": "malicious_uri_filter_result",
+    "csam": "csam_filter_filter_result",
+    "rai": "rai_filter_result",
+}
+
+
+def _nested_result_matched(nested) -> bool:
+    """Different filter result types nest their verdict differently:
+    pi_and_jailbreak_filter_result has match_state directly on itself;
+    sdp_filter_result nests it one level deeper under inspect_result
+    (confirmed against a live API response for both shapes - the SDP
+    result type has room for a separate advanced/deidentify result this
+    template doesn't enable). Tries both shapes, returns False rather
+    than raising if neither matches - this only feeds the human-readable
+    reason string, not the actual block/allow/redact decision, which is
+    already settled by the top-level filter_match_state before this
+    function is ever called."""
+    for candidate in (nested, getattr(nested, "inspect_result", None)):
+        state = getattr(candidate, "match_state", None)
+        if state is not None:
+            return state.name == "MATCH_FOUND"
+    return False
+
 
 def _interpret(sanitization_result, original_text: str, *, is_input: bool) -> ArmorResult:
-    """Model Armor's exact response shape can shift between client
-    versions; this reads it defensively and falls back locally rather
-    than raising if a field isn't where expected."""
+    """Model Armor's response is a nested protobuf. filter_match_state is
+    a bare enum whose str() gives its ordinal ("2"), not its name
+    ("MATCH_FOUND") - checking `"MATCH_FOUND" in str(enum_value)` is
+    always False and silently allows everything through. This cost a
+    real, live-tested block: confirmed against the real API that a
+    template with pi_and_jailbreak fully enabled correctly returns
+    MATCH_FOUND for the exact SPEC R8 acceptance-criterion injection
+    string, and the old code here still returned "allow" for it. Compare
+    via `.name` (or the enum member itself), never str(), for any proto
+    enum field - true for filter_match_state here and for each nested
+    filter result's own match_state below.
+    """
     try:
-        match_state = str(getattr(sanitization_result, "filter_match_state", ""))
-        matched = "MATCH_FOUND" in match_state
+        matched = sanitization_result.filter_match_state.name == "MATCH_FOUND"
 
         if not matched:
             return ArmorResult(verdict="allow", reason="Model Armor: no filter matched", source="model_armor")
 
-        filter_results = getattr(sanitization_result, "filter_results", {}) or {}
-        matched_filters = [name for name, result in dict(filter_results).items()
-                            if "MATCH_FOUND" in str(getattr(result, "match_state", result))]
+        matched_filters = []
+        for key, result in dict(sanitization_result.filter_results).items():
+            field_name = _NESTED_RESULT_FIELD_BY_KEY.get(key)
+            nested = getattr(result, field_name, None) if field_name else None
+            if nested is not None and _nested_result_matched(nested):
+                matched_filters.append(key)
 
         if is_input:
             return ArmorResult(
