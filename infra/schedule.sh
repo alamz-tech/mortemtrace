@@ -21,7 +21,7 @@ DEMO_ORG="${MORTEMTRACE_DEMO_ORG:-org_demo}"
 gcloud scheduler jobs create http mortemtrace-watcher-sweep \
   --project "${PROJECT}" \
   --location "${REGION}" \
-  --schedule "*/5 * * * *" \
+  --schedule "*/30 * * * *" \
   --uri "${INGEST_URL}/watcher/sweep" \
   --http-method POST \
   --headers "Content-Type=application/json" \
@@ -30,7 +30,7 @@ gcloud scheduler jobs create http mortemtrace-watcher-sweep \
   || gcloud scheduler jobs update http mortemtrace-watcher-sweep \
        --project "${PROJECT}" \
        --location "${REGION}" \
-       --schedule "*/5 * * * *" \
+       --schedule "*/30 * * * *" \
        --uri "${INGEST_URL}/watcher/sweep" \
        --http-method POST \
        --headers "Content-Type=application/json" \
@@ -38,7 +38,7 @@ gcloud scheduler jobs create http mortemtrace-watcher-sweep \
        --attempt-deadline 60s
 
 echo
-echo "Watcher sweep scheduled every 5 minutes. For a live demo trigger with"
+echo "Watcher sweep scheduled every 30 minutes. For a live demo trigger with"
 echo "a specific injected signal instead of waiting on the schedule:"
 echo "  curl -X POST ${INGEST_URL}/watcher/sweep -H 'Content-Type: application/json' \\"
 echo "    -d '{\"org_id\": \"${DEMO_ORG}\", \"injected_signal\": {...}}'"
