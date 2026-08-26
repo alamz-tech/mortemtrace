@@ -158,7 +158,17 @@ def _pubsub_client() -> pubsub_v1.PublisherClient:
 
 def _publish_pubsub(topic: str, payload: dict) -> None:
     """Real Pub/Sub publish. Project comes from GOOGLE_CLOUD_PROJECT;
-    topic path is projects/{project}/topics/{topic}."""
+    topic path is projects/{project}/topics/{topic}.
+
+    Does not block on the publish Future's result(): the client library
+    confirms delivery asynchronously in its own background thread, and
+    waiting for that confirmation synchronously here was real,
+    measurable latency on /ingest's critical path for zero benefit the
+    caller can act on (the HTTP response only ever returns run_id/
+    incident_id regardless of whether the publish confirmation has
+    landed yet). A failure is still observable - the done-callback logs
+    it - rather than silently discarded; it just doesn't block the
+    request that triggered it."""
     project = os.environ.get("GOOGLE_CLOUD_PROJECT")
     if not project:
         logger.warning(
@@ -169,7 +179,14 @@ def _publish_pubsub(topic: str, payload: dict) -> None:
     client = _pubsub_client()
     topic_path = client.topic_path(project, topic)
     data = json.dumps(payload, default=str).encode("utf-8")
-    client.publish(topic_path, data).result(timeout=10)
+    future = client.publish(topic_path, data)
+    future.add_done_callback(lambda f: _log_publish_failure(f, topic))
+
+
+def _log_publish_failure(future, topic: str) -> None:
+    exc = future.exception()
+    if exc is not None:
+        logger.error("Pub/Sub publish to topic=%s failed after the request already returned: %s", topic, exc)
 
 
 def _dispatch_evidence_received(envelope: Envelope) -> None:
