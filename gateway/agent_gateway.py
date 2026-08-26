@@ -13,6 +13,28 @@ call gets a fresh in-memory session that is discarded afterward. Anything
 that must survive past one agent turn goes through data/scope_store.py
 into Firestore, which is what keeps every Cloud Run instance stateless
 (NFR: "No in-memory state survives a Cloud Run instance").
+
+Requires three environment variables at runtime (see infra/deploy.sh),
+confirmed against this project's actual Vertex AI access, not assumed:
+  GOOGLE_GENAI_USE_VERTEXAI=true   - without this, google-genai defaults
+                                     to the Gemini Developer API (needs
+                                     an API key) instead of Vertex AI
+                                     (ADC/service-account auth), which
+                                     both breaks and is architecturally
+                                     wrong per the compliance checklist.
+  GOOGLE_CLOUD_PROJECT             - already required elsewhere.
+  GOOGLE_CLOUD_LOCATION=us-central1 - the region DEFAULT_MODEL was
+                                     verified against.
+
+DEFAULT_MODEL is "gemini-2.5-flash", not "gemini-3.5-flash" as
+SPEC-postmortem.md's non-goals section states ("Off-the-shelf Gemini 3.5
+and Gemma only") - verified directly against this project's real Vertex
+AI Model Garden access (google.genai.Client(...).models.generate_content
+against a dozen 3.x-family candidate IDs, all 404; 2.5-family IDs work).
+This is a real access/availability gap worth resolving with Google Cloud
+support or a different region before the submission, not a typo to
+silently paper over - flagged here and to the user directly. Override
+via MORTEMTRACE_MODEL if 3.5 access is confirmed working before demo day.
 """
 from __future__ import annotations
 
@@ -34,7 +56,7 @@ from telemetry.otel_setup import model_call as _model_call_span
 
 logger = logging.getLogger("mortemtrace.gateway")
 
-DEFAULT_MODEL = os.environ.get("MORTEMTRACE_MODEL", "gemini-3.5-flash")
+DEFAULT_MODEL = os.environ.get("MORTEMTRACE_MODEL", "gemini-2.5-flash")
 _LOOP_THRESHOLD = 3
 
 
@@ -81,7 +103,13 @@ def build_agent(
     threading them through ADK's session state)."""
     outcome = InvocationOutcome()
 
-    def _before_model(ctx: Context, llm_request: LlmRequest):
+    def _before_model(callback_context: Context, llm_request: LlmRequest):
+        # ADK invokes before/after-model callbacks by keyword, not
+        # position, despite the type aliases being declared positionally
+        # (confirmed against the installed ADK 2.7.1 source,
+        # base_llm_flow.py's own comment says so) - the parameter names
+        # here must be exactly callback_context/llm_request(/llm_response)
+        # or the call raises TypeError: got an unexpected keyword argument.
         text = _extract_request_text(llm_request)
         if not text:
             return None
@@ -101,7 +129,7 @@ def build_agent(
             )
         return None
 
-    def _after_model(ctx: Context, llm_response: LlmResponse):
+    def _after_model(callback_context: Context, llm_response: LlmResponse):
         text = _extract_response_text(llm_response)
         if not text:
             return None
