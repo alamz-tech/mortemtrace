@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import json
 import logging
 import os
@@ -243,24 +244,45 @@ def _handle_ingest(org_id: str, kind: EvidenceKind, incident_id: Optional[str], 
     with otel_setup.span("mortemtrace.api", "ingest", run_id=run_id, org_id=org_id, incident_id=incident_id) as current_span:
         claim = _ingest_claim(org_id, run_id)
 
-        if incident_id is None:
-            incident = Incident(incident_id=new_id("inc"), org_id=org_id, opened_at=now(), status="open")
-            scope_store.write(
-                claim, Collection.INCIDENTS, incident.incident_id, incident.model_dump(mode="json"),
-            )
-            incident_id = incident.incident_id
-        # else: reuse the given incident_id as-is. Deliberately no synchronous
-        # existence check here - staying under the 500ms budget matters more
-        # than validating a caller-supplied ID before handing off to Intake.
+        # incident_id is generated up front (not read back from a write
+        # result) specifically so the Incident write, when needed, and the
+        # RawEvidence write can run concurrently instead of sequentially -
+        # they're independent documents in independent collections, and
+        # RawEvidence only needs incident_id as a *value* to reference, not
+        # as proof the Incident write already landed. This is the second
+        # half of closing the gap on R2's <500ms: caching clients and
+        # moving off the event loop got a live request from 60+s to ~1-2s,
+        # and two sequential Firestore round-trips were the rest of it.
+        creating_incident = incident_id is None
+        if creating_incident:
+            incident_id = new_id("inc")
         current_span.set_attribute("mortemtrace.incident_id", incident_id)
 
         raw_evidence = RawEvidence(
             event_id=new_id("eventraw"), org_id=org_id, incident_ref=incident_id,
             kind=kind, payload=body_text, received_at=now(),
         )
-        scope_store.write(
-            claim, Collection.RAW_EVIDENCE, raw_evidence.event_id, raw_evidence.model_dump(mode="json"),
-        )
+
+        def _write_incident() -> None:
+            incident = Incident(incident_id=incident_id, org_id=org_id, opened_at=now(), status="open")
+            scope_store.write(claim, Collection.INCIDENTS, incident.incident_id, incident.model_dump(mode="json"))
+
+        def _write_raw_evidence() -> None:
+            scope_store.write(
+                claim, Collection.RAW_EVIDENCE, raw_evidence.event_id, raw_evidence.model_dump(mode="json"),
+            )
+
+        # else (not creating_incident): reuse the given incident_id as-is,
+        # only the RawEvidence write happens. Deliberately no synchronous
+        # existence check on a caller-supplied incident_id - staying under
+        # budget matters more than validating it before handing off to Intake.
+        if creating_incident:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(_write_incident), pool.submit(_write_raw_evidence)]
+                for future in futures:
+                    future.result()
+        else:
+            _write_raw_evidence()
 
         evidence_received = EvidenceReceived(
             run_id=claim.run_id, org_id=org_id, incident_ref=incident_id,
