@@ -134,8 +134,48 @@ def run(claim: OrgClaim, envelope: Envelope) -> RunResult:
         "diagnosis wrote %s for incident %s (confidence=%.2f, prior_incident_refs=%s)",
         hypothesis.hypothesis_id, incident_id, hypothesis.confidence, hypothesis.prior_incident_refs,
     )
+    _remember_signature(claim, incident_id, hypothesis)
 
     return RunResult(status="ok", tokens_used=invoked.tokens_used, turns=invoked.turns)
+
+
+def _remember_signature(claim: OrgClaim, incident_id: str, hypothesis: Hypothesis) -> None:
+    """Writes this incident's diagnosis back to Memory Bank so a LATER
+    incident's Diagnosis run can retrieve it via memory_bank.retrieve(
+    kind="incident_signature") - the read side above already existed and
+    always ran, but nothing ever wrote to it: R6's "learns across
+    incidents" had zero write call sites anywhere in the codebase, so
+    every Diagnosis prompt permanently said "No prior incident signatures
+    available in Memory Bank," regardless of how many incidents had
+    actually been diagnosed.
+
+    key is deterministic (sig_{incident_id}), not new_id(): a re-
+    diagnosis of the SAME incident (a redelivery, or Watcher's
+    upstream.matched re-triggering Diagnosis after timeline.committed
+    already did) should update its own signature, not accumulate
+    duplicate entries that would all independently match future queries.
+
+    Degrade-not-fail, matching the pattern elsewhere in this file
+    (_recent_changes' try_query): the hypothesis itself is already
+    durably written and is the source of truth for THIS incident. A
+    failure to also write the memory signature is a lost enrichment for
+    FUTURE incidents, not a reason to fail a run that already succeeded.
+    """
+    record = MemoryRecord(
+        key=f"sig_{incident_id}",
+        org_id=claim.org_id,
+        kind="incident_signature",
+        content={"statement": hypothesis.statement, "confidence": hypothesis.confidence},
+        related_incident_ids=[incident_id],
+    )
+    try:
+        memory_bank.remember(claim, record)
+    except Exception:
+        logger.warning(
+            "could not write incident_signature to Memory Bank for incident %s; "
+            "the hypothesis itself is already written and unaffected", incident_id,
+            exc_info=True,
+        )
 
 
 # How far back to look for a change that could plausibly have caused this

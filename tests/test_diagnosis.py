@@ -49,12 +49,16 @@ def _seed_diagnosis_agent(fake_db) -> None:
     seed_agent(
         fake_db, "diagnosis", "1.0.0",
         read_scopes=[Collection.TIMELINE, Collection.RAW_EVIDENCE, Collection.MEMORY],
-        write_scopes=[Collection.HYPOTHESES],
+        write_scopes=[Collection.HYPOTHESES, Collection.MEMORY],
     )
 
 
 def _hypotheses(fake_db) -> list[dict]:
     return [d for path, d in fake_db._docs.items() if path[:3] == ("tenants", TEST_ORG, "hypotheses")]
+
+
+def _memory_records(fake_db) -> list[dict]:
+    return [d for path, d in fake_db._docs.items() if path[:3] == ("tenants", TEST_ORG, "memory")]
 
 
 # --------------------------------------------------------------------------
@@ -101,6 +105,144 @@ def test_diagnosis_flattens_multiple_cited_entries(fake_db, monkeypatch):
 
     assert result.status == "ok"
     assert _hypotheses(fake_db)[0]["source_event_ids"] == ["evt_1", "evt_2"]
+
+
+# --------------------------------------------------------------------------
+# R6 - the WRITE side: a diagnosis must actually land in Memory Bank
+#
+# Regression, found in a security/reliability self-review: retrieve() was
+# called on every run and always ran correctly, but remember() had zero
+# call sites anywhere in the non-test codebase - R6's "learns across
+# incidents" was structurally unimplemented. Every Diagnosis prompt
+# always said "No prior incident signatures available," no matter how
+# many incidents had actually been diagnosed.
+# --------------------------------------------------------------------------
+
+def test_diagnosis_writes_an_incident_signature_to_memory_bank(fake_db, monkeypatch):
+    _seed_diagnosis_agent(fake_db)
+    _seed_timeline(fake_db)
+    monkeypatch.setattr(
+        "gateway.agent_gateway.invoke",
+        lambda agent, prompt, **kw: agent_gateway.InvokeResult(
+            text='{"statement": "pods OOM-killed under load", "confidence": 0.8, '
+                 '"source_entry_indices": [0], "prior_incident_refs": []}',
+            tokens_used=80, turns=1,
+        ),
+    )
+
+    result = diagnosis.run(_claim(), _envelope(incident_id="inc_1"))
+
+    assert result.status == "ok"
+    records = _memory_records(fake_db)
+    assert len(records) == 1
+    assert records[0]["kind"] == "incident_signature"
+    assert records[0]["related_incident_ids"] == ["inc_1"]
+    assert records[0]["content"]["statement"] == "pods OOM-killed under load"
+
+
+def test_a_later_incidents_diagnosis_actually_sees_the_earlier_signature(fake_db, monkeypatch):
+    """The actual end-to-end proof, not just 'a record got written':
+    diagnose incident 1, then diagnose an UNRELATED incident 2, and
+    confirm incident 1's real signature - written by a real run of this
+    same function, not seeded by hand - appears in incident 2's prompt.
+    This is the exact gap that made R6 permanently unreachable: retrieve()
+    worked fine in isolation, but nothing upstream of it had ever
+    written anything for it to find."""
+    _seed_diagnosis_agent(fake_db)
+    _seed_timeline(fake_db, incident_id="inc_1")
+    monkeypatch.setattr(
+        "gateway.agent_gateway.invoke",
+        lambda agent, prompt, **kw: agent_gateway.InvokeResult(
+            text='{"statement": "checkout-worker OOM-killed under load", "confidence": 0.8, '
+                 '"source_entry_indices": [0], "prior_incident_refs": []}',
+            tokens_used=80, turns=1,
+        ),
+    )
+    first = diagnosis.run(_claim(run_id="run_1"), _envelope(incident_id="inc_1", run_id="run_1"))
+    assert first.status == "ok"
+
+    _seed_timeline(fake_db, incident_id="inc_2", entries=[
+        {"ts": "2026-08-26T03:00:00Z", "actor": "alert", "action": "pods crash-looping again",
+         "evidence": "CrashLoopBackOff on checkout-worker, second time this week",
+         "source_event_ids": ["evt_9"]},
+    ])
+    captured_prompt = {}
+
+    def _capture_and_respond(agent, prompt, **kw):
+        captured_prompt["text"] = prompt
+        return agent_gateway.InvokeResult(
+            text='{"statement": "recurrence of prior OOM pattern", "confidence": 0.7, '
+                 '"source_entry_indices": [0], "prior_incident_refs": ["inc_1"]}',
+            tokens_used=80, turns=1,
+        )
+
+    monkeypatch.setattr("gateway.agent_gateway.invoke", _capture_and_respond)
+
+    second = diagnosis.run(_claim(run_id="run_2"), _envelope(incident_id="inc_2", run_id="run_2"))
+
+    assert second.status == "ok"
+    assert "No prior incident signatures available" not in captured_prompt["text"]
+    assert "checkout-worker OOM-killed under load" in captured_prompt["text"]
+    assert _hypotheses(fake_db)[1]["prior_incident_refs"] == ["inc_1"]
+
+
+def test_rediagnosing_the_same_incident_updates_its_signature_not_duplicates_it(fake_db, monkeypatch):
+    """key=f"sig_{incident_id}" is deterministic, not new_id() - a
+    redelivery or a second trigger (Watcher's upstream.matched re-firing
+    Diagnosis after timeline.committed already did) for the SAME
+    incident must update its own signature, not accumulate duplicates
+    that would all independently match a future query."""
+    _seed_diagnosis_agent(fake_db)
+    _seed_timeline(fake_db)
+    monkeypatch.setattr(
+        "gateway.agent_gateway.invoke",
+        lambda agent, prompt, **kw: agent_gateway.InvokeResult(
+            text='{"statement": "first pass diagnosis", "confidence": 0.5, '
+                 '"source_entry_indices": [0], "prior_incident_refs": []}',
+            tokens_used=80, turns=1,
+        ),
+    )
+    diagnosis.run(_claim(run_id="run_1"), _envelope(incident_id="inc_1", run_id="run_1"))
+
+    monkeypatch.setattr(
+        "gateway.agent_gateway.invoke",
+        lambda agent, prompt, **kw: agent_gateway.InvokeResult(
+            text='{"statement": "revised diagnosis after more evidence", "confidence": 0.9, '
+                 '"source_entry_indices": [0], "prior_incident_refs": []}',
+            tokens_used=80, turns=1,
+        ),
+    )
+    diagnosis.run(_claim(run_id="run_2"), _envelope(incident_id="inc_1", run_id="run_2"))
+
+    records = _memory_records(fake_db)
+    assert len(records) == 1
+    assert records[0]["content"]["statement"] == "revised diagnosis after more evidence"
+
+
+def test_memory_write_failure_does_not_fail_an_otherwise_successful_run(fake_db, monkeypatch):
+    """Degrade-not-fail: the hypothesis is already durably written and is
+    the source of truth for this incident. A Memory Bank write failure
+    must cost future incidents an enrichment, not this run its result."""
+    seed_agent(
+        fake_db, "diagnosis", "1.0.0",
+        read_scopes=[Collection.TIMELINE, Collection.RAW_EVIDENCE, Collection.MEMORY],
+        write_scopes=[Collection.HYPOTHESES],  # deliberately NO Collection.MEMORY
+    )
+    _seed_timeline(fake_db)
+    monkeypatch.setattr(
+        "gateway.agent_gateway.invoke",
+        lambda agent, prompt, **kw: agent_gateway.InvokeResult(
+            text='{"statement": "pods OOM-killed under load", "confidence": 0.8, '
+                 '"source_entry_indices": [0], "prior_incident_refs": []}',
+            tokens_used=80, turns=1,
+        ),
+    )
+
+    result = diagnosis.run(_claim(), _envelope())
+
+    assert result.status == "ok"  # not dead_letter, despite the memory write being denied
+    assert len(_hypotheses(fake_db)) == 1
+    assert _memory_records(fake_db) == []
 
 
 # --------------------------------------------------------------------------

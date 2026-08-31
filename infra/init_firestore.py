@@ -108,7 +108,11 @@ _FLEET: list[dict] = [
             Collection.TIMELINE, Collection.RAW_EVIDENCE, Collection.MEMORY,
             Collection.CHANGE_EVENTS,
         ],
-        write_scopes=[Collection.HYPOTHESES],
+        # MEMORY write is for Diagnosis's own incident_signature record
+        # (agents/diagnosis/diagnosis.py) - previously read-only, so R6's
+        # "learns across incidents" had nowhere to write the thing a
+        # later incident's Diagnosis run would need to read.
+        write_scopes=[Collection.HYPOTHESES, Collection.MEMORY],
         department=None,
     ),
     dict(
