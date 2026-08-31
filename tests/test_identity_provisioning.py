@@ -231,6 +231,48 @@ def test_public_demo_auto_join_requires_the_explicit_demo_flag(fake_db):
     assert scope_store.get_membership(demo_visitor.user_id, demo_org["org_id"])["role"] == "member"
 
 
+def test_revoked_domain_auto_join_member_stays_revoked_on_relogin(fake_db):
+    """Regression: get_membership() collapses a revoked row to None, and
+    the old auto-join check used exactly that to decide whether to
+    create a membership - so a revoked user simply logging in again
+    silently resurrected them as active. Revocation must be a terminal
+    state an admin action undoes, not a side effect of a relogin."""
+    org = scope_store.create_organization("Acme Inc.", "user_founder")
+    fake_db.seed(f"organizations/{org['org_id']}", {**org, "auto_join_domains": ["acme.com"]})
+    identity = _identity("exemployee@acme.com")
+
+    first_login = provisioning.resolve_login(identity)
+    assert first_login.landed_org_id == org["org_id"]
+
+    scope_store.revoke_membership("user_founder", org["org_id"], first_login.user_id)
+    assert scope_store.get_membership(first_login.user_id, org["org_id"]) is None
+
+    second_login = provisioning.resolve_login(identity)
+
+    assert second_login.memberships == []
+    assert scope_store.get_membership(first_login.user_id, org["org_id"]) is None
+    raw = scope_store.get_membership_any_status(first_login.user_id, org["org_id"])
+    assert raw["status"] == "revoked"
+
+
+def test_revoked_demo_member_stays_revoked_on_relogin_via_login_demo(fake_db):
+    """Same bug, the other auto-join path: /login/demo re-running for a
+    user an admin removed from the demo org must not un-remove them."""
+    demo_org = scope_store.create_organization("Demo Org", "user_founder")
+    fake_db.seed(f"organizations/{demo_org['org_id']}", {**demo_org, "public_demo_auto_join": True})
+    identity = _identity("judge@personal-email.example", demo=True)
+
+    first_login = provisioning.resolve_login(identity)
+    assert first_login.landed_org_id == demo_org["org_id"]
+
+    scope_store.revoke_membership("user_founder", demo_org["org_id"], first_login.user_id)
+
+    second_login = provisioning.resolve_login(identity)
+
+    assert second_login.memberships == []
+    assert scope_store.get_membership(first_login.user_id, demo_org["org_id"]) is None
+
+
 def test_invite_redemption_requires_matching_email(fake_db):
     """Possessing an invite link is not proof of identity - only the
     person who authenticates AS the invited email may redeem it."""

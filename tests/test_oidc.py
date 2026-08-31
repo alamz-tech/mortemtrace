@@ -52,6 +52,8 @@ def _sign_id_token(key, *, issuer, audience, subject, nonce, email="alice@exampl
 
 def _mock_network(monkeypatch, *, discovery: dict, jwks: dict) -> None:
     class _Resp:
+        is_redirect = False
+
         def __init__(self, payload):
             self._payload = payload
 
@@ -61,7 +63,7 @@ def _mock_network(monkeypatch, *, discovery: dict, jwks: dict) -> None:
         def json(self):
             return self._payload
 
-    def fake_get(url, timeout=None):
+    def fake_get(url, timeout=None, allow_redirects=True):
         if url.endswith("/.well-known/openid-configuration"):
             return _Resp(discovery)
         if url.endswith("/jwks"):
@@ -69,6 +71,13 @@ def _mock_network(monkeypatch, *, discovery: dict, jwks: dict) -> None:
         raise AssertionError(f"unexpected GET {url}")
 
     monkeypatch.setattr(oidc.requests, "get", fake_get)
+    # The SSRF host check does a real DNS lookup - out of scope for this
+    # file's tests (which exercise JWT/handshake verification against a
+    # fake issuer domain that doesn't resolve at all) and dedicated tests
+    # of its own live below. Bypassed here, not deleted from the code
+    # path: _safe_get still runs, still enforces https-only and no-
+    # redirects, just not the DNS-dependent half.
+    monkeypatch.setattr(oidc, "_reject_non_public_host", lambda hostname: None)
 
 
 def _configure_google(monkeypatch) -> None:
@@ -296,6 +305,106 @@ def test_google_login_unavailable_without_client_credentials(monkeypatch):
     assert oidc.google_login_available() is False
     with pytest.raises(oidc.OidcError):
         oidc.start_google_login(_BASE_URL)
+
+
+# --------------------------------------------------------------------------
+# SSRF protection on admin-supplied issuer/JWKS URLs
+#
+# Regression, found in a security self-review: org SSO's `issuer` is
+# admin-supplied (anyone can self-register an org and configure "their
+# own" SSO - console/ui.py's /orgs/{org_id}/sso), and the discovery/JWKS
+# fetch made a plain requests.get() with no host restriction - reachable
+# SSRF against, among other targets, Cloud Run's own metadata server.
+# --------------------------------------------------------------------------
+
+def test_reject_non_public_host_blocks_loopback():
+    with pytest.raises(oidc.OidcError):
+        oidc._reject_non_public_host("127.0.0.1")
+
+
+def test_reject_non_public_host_blocks_metadata_server_address():
+    """169.254.169.254 specifically - the cloud metadata service address
+    on GCP, AWS, and Azure alike, and exactly the kind of target this
+    check exists to deny reaching via an admin-configured issuer URL."""
+    with pytest.raises(oidc.OidcError):
+        oidc._reject_non_public_host("169.254.169.254")
+
+
+def test_reject_non_public_host_blocks_rfc1918_private_ranges():
+    for host in ("10.0.0.5", "172.16.0.5", "192.168.1.5"):
+        with pytest.raises(oidc.OidcError):
+            oidc._reject_non_public_host(host)
+
+
+def test_reject_non_public_host_allows_a_real_public_address():
+    """8.8.8.8 (Google's public DNS) as a stand-in for "a real IdP's
+    public issuer host" - must NOT be rejected, or the check would break
+    every legitimate SSO configuration, not just malicious ones."""
+    oidc._reject_non_public_host("8.8.8.8")  # does not raise
+
+
+def test_validated_https_url_rejects_non_https_scheme():
+    with pytest.raises(oidc.OidcError):
+        oidc._validated_https_url("http://accounts.google.com/x", what="issuer")
+
+
+def test_safe_get_refuses_a_redirect_response(monkeypatch):
+    """_reject_non_public_host only checks the address behind the URL
+    given - requests() follows redirects by default, so a validated
+    public host redirecting to an internal one would otherwise sail
+    past the check on the second hop. Must refuse the redirect outright,
+    not follow it."""
+    class _RedirectResp:
+        is_redirect = True
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(oidc, "_reject_non_public_host", lambda hostname: None)
+    monkeypatch.setattr(oidc.requests, "get", lambda url, timeout=None, allow_redirects=True: _RedirectResp())
+
+    with pytest.raises(oidc.OidcError):
+        oidc._safe_get("https://idp.example.com/.well-known/openid-configuration", what="OIDC discovery document")
+
+
+# --------------------------------------------------------------------------
+# Cross-tenant OIDC client-secret isolation
+#
+# Regression, found in the same self-review: MORTEMTRACE_OIDC_CLIENT_SECRETS
+# is one flat table shared by every tenant, and the lookup used to be by
+# secret_ref alone - an org admin's own form input - with no check that
+# the ref actually belonged to their org. Any self-registered admin
+# could reference (and receive) another organization's real SSO client
+# secret.
+# --------------------------------------------------------------------------
+
+def test_oidc_client_secret_is_scoped_by_org_id(monkeypatch):
+    """The lookup key is built from org_id + ref, never ref alone - so
+    the same ref string under two different orgs resolves to two
+    different (or absent) secrets."""
+    monkeypatch.setenv(
+        oidc._OIDC_CLIENT_SECRETS_ENV,
+        '{"org_victim:acme-secret": "victim-real-secret", "org_attacker:acme-secret": "attacker-own-secret"}',
+    )
+
+    assert oidc._oidc_client_secret("org_victim", "acme-secret") == "victim-real-secret"
+    assert oidc._oidc_client_secret("org_attacker", "acme-secret") == "attacker-own-secret"
+
+
+def test_attacker_org_cannot_reference_victim_orgs_secret_ref(monkeypatch):
+    """The actual attack this closes: attacker knows (or guesses) the
+    exact ref string a victim org uses, and configures their OWN org's
+    SSO with that same ref. Must resolve to nothing for the attacker,
+    not to the victim's secret."""
+    monkeypatch.setenv(
+        oidc._OIDC_CLIENT_SECRETS_ENV,
+        '{"org_victim:acme-entra-secret": "victim-real-secret-value"}',
+    )
+
+    stolen = oidc._oidc_client_secret("org_attacker", "acme-entra-secret")
+
+    assert stolen is None
+    assert stolen != "victim-real-secret-value"
 
 
 def test_stable_user_id_is_deterministic_and_issuer_scoped():

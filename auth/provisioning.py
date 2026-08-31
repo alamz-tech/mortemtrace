@@ -64,12 +64,32 @@ def _redeem_invite_if_valid(token: str, identity: oidc.VerifiedIdentity, user_id
         pass  # redeemed/revoked by someone else between the lookup and here
 
 
+def _auto_join(user_id: str, org_id: str) -> None:
+    """Shared by both auto-join paths below. Regression, found in a
+    security self-review: this used to check get_membership() (which
+    collapses a revoked row to None) before deciding whether to create
+    one, so a revoked user simply logging in again - via /login/demo, or
+    because their email domain is in an org's auto_join_domains -
+    silently resurrected them as an active member. An admin's revoke
+    action was reversible by the person it targeted, with no further
+    action on their part and nothing logging that it happened.
+
+    get_membership_any_status() sees the revoked row for what it is and
+    this refuses to touch it - revocation is now a terminal state that
+    only an admin action (update_membership_role /
+    a fresh create_membership call) can undo, not a side effect of
+    logging in."""
+    existing = scope_store.get_membership_any_status(user_id, org_id)
+    if existing is not None:
+        return  # already a member (active) or was one and got revoked - either way, not auto-join's call
+    scope_store.create_membership(user_id, org_id, role="member")
+
+
 def _join_public_demo(user_id: str) -> None:
     demo_org = scope_store.find_public_demo_organization()
     if demo_org is None:
         return
-    if scope_store.get_membership(user_id, demo_org["org_id"]) is None:
-        scope_store.create_membership(user_id, demo_org["org_id"], role="member")
+    _auto_join(user_id, demo_org["org_id"])
 
 
 def _apply_domain_auto_join(email: str, user_id: str) -> None:
@@ -79,5 +99,4 @@ def _apply_domain_auto_join(email: str, user_id: str) -> None:
     org = scope_store.find_organization_by_domain(domain)
     if org is None:
         return
-    if scope_store.get_membership(user_id, org["org_id"]) is None:
-        scope_store.create_membership(user_id, org["org_id"], role="member")
+    _auto_join(user_id, org["org_id"])

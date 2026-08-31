@@ -772,6 +772,68 @@ def test_sso_settings_save_and_clear(fake_db):
     assert scope_store.get_organization(TEST_ORG)["sso"] is None
 
 
+def test_sso_settings_form_cannot_set_domain_hint(fake_db):
+    """Regression: domain_hint used to be a plain field on this
+    self-service form, with no proof the submitting org actually owns
+    the domain. Org creation is open to anyone with a Google account, so
+    an admin could previously claim any company's domain here and
+    capture that company's employees' login attempts. It's operator-set
+    only now (infra/set_sso_domain_hint.py) - this form must silently
+    ignore whatever value is posted for it, not error on it (an admin
+    copy-pasting an old saved form shouldn't get a 400)."""
+    seed_membership(fake_db, TEST_USER, TEST_ORG, role="admin")
+    fake_db.seed(f"organizations/{TEST_ORG}", {
+        "org_id": TEST_ORG, "display_name": "Test Org", "created_at": "2026-01-01T00:00:00+00:00",
+        "created_by": TEST_USER, "sso": None, "auto_join_domains": [], "public_demo_auto_join": False,
+    })
+    browser = _browser_for(TEST_USER)
+
+    browser.post(
+        f"/orgs/{TEST_ORG}/sso",
+        data={
+            "action": "save", "issuer": "https://login.microsoftonline.com/tenant/v2.0",
+            "client_id": "client-123", "client_secret_ref": "acme-secret",
+            "domain_hint": "victimcorp.com",  # attempted, must be ignored
+            "csrf_token": _csrf_for(TEST_USER),
+        },
+        follow_redirects=False,
+    )
+
+    from data import scope_store
+    org = scope_store.get_organization(TEST_ORG)
+    assert org["sso"]["domain_hint"] is None
+
+
+def test_sso_settings_form_preserves_an_operator_set_domain_hint(fake_db):
+    """Saving other SSO fields (issuer/client_id/ref) must not silently
+    clear a domain_hint an operator already set out of band - the form
+    only refuses to let a NEW one be set through it."""
+    seed_membership(fake_db, TEST_USER, TEST_ORG, role="admin")
+    fake_db.seed(f"organizations/{TEST_ORG}", {
+        "org_id": TEST_ORG, "display_name": "Test Org", "created_at": "2026-01-01T00:00:00+00:00",
+        "created_by": TEST_USER,
+        "sso": {"issuer": "https://old.example.com", "client_id": "old", "client_secret_ref": "old",
+                "domain_hint": "acme.com"},
+        "auto_join_domains": [], "public_demo_auto_join": False,
+    })
+    browser = _browser_for(TEST_USER)
+
+    browser.post(
+        f"/orgs/{TEST_ORG}/sso",
+        data={
+            "action": "save", "issuer": "https://login.microsoftonline.com/tenant/v2.0",
+            "client_id": "client-123", "client_secret_ref": "acme-secret",
+            "csrf_token": _csrf_for(TEST_USER),
+        },
+        follow_redirects=False,
+    )
+
+    from data import scope_store
+    org = scope_store.get_organization(TEST_ORG)
+    assert org["sso"]["domain_hint"] == "acme.com"
+    assert org["sso"]["issuer"] == "https://login.microsoftonline.com/tenant/v2.0"
+
+
 def test_sso_settings_rejects_a_non_https_issuer(fake_db):
     """An http:// (or otherwise non-https) issuer would send credentials
     over plaintext during the OIDC handshake - rejected outright rather

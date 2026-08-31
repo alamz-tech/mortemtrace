@@ -874,6 +874,25 @@ def get_membership(user_id: str, org_id: str) -> Optional[dict]:
     return data if data and data.get("status") == "active" else None
 
 
+def get_membership_any_status(user_id: str, org_id: str) -> Optional[dict]:
+    """Like get_membership, but returns a revoked row too instead of
+    treating it as absent.
+
+    Exists specifically for the auto-join call sites in
+    auth/provisioning.py: they need to tell "never a member" (auto-join
+    is correct) apart from "was a member, an admin revoked them" (auto-
+    join must NOT silently undo that decision). get_membership()
+    deliberately can't make that distinction - collapsing revoked to
+    None is exactly right for every other caller, which only ever wants
+    to know "may this person act right now."
+    """
+    doc = (
+        _client().collection(_MEMBERSHIPS_ROOT).document(_membership_id(user_id, org_id))
+        .get(timeout=_OP_TIMEOUT_SECONDS)
+    )
+    return doc.to_dict() if doc.exists else None
+
+
 def list_memberships_for_user(user_id: str) -> list[dict]:
     """Every org this user may act as - what the login/org-switcher flow
     resolves a session down to. Excludes revoked rows: deprovisioning

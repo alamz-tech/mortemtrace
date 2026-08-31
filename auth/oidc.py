@@ -22,13 +22,16 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
 import secrets
+import socket
 import time
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 from authlib.integrations.requests_client import OAuth2Session
@@ -71,22 +74,101 @@ def _secret() -> bytes:
     return secret.encode("utf-8")
 
 
+_DISCOVERY_CACHE_MAX_ENTRIES = 256
+
+
+def _reject_non_public_host(hostname: str) -> None:
+    """Refuses to resolve/fetch a hostname whose DNS answer is a private,
+    loopback, link-local, or otherwise internal address.
+
+    Found in a security self-review, not exploited in production:
+    `issuer` for org SSO is admin-supplied (anyone can self-register an
+    org and configure "their own" SSO issuer - see console/ui.py's
+    /orgs/{org_id}/sso route), and this function's only caller made a
+    plain requests.get() against it with no host restriction at all -
+    the textbook shape of SSRF, reachable by any self-registered user,
+    against Cloud Run's own metadata server among other targets.
+
+    Resolves via DNS rather than trusting the hostname string alone,
+    since a hostname that looks public can still resolve to an internal
+    address (attacker-controlled DNS, or DNS rebinding between this
+    check and the actual request) - checking the string would miss
+    exactly the attack this exists to stop. Rejects if ANY resolved
+    address is non-public, not just the first, since a multi-A-record
+    response only needs one internal answer to matter.
+    """
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror as exc:
+        raise OidcError(f"could not resolve issuer host {hostname!r}: {exc}") from exc
+
+    for _family, _, _, _, sockaddr in infos:
+        raw_ip = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(raw_ip)
+        except ValueError:
+            continue
+        if (
+            ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+        ):
+            raise OidcError(
+                f"issuer host {hostname!r} resolves to a non-public address "
+                f"({raw_ip}) - refusing to fetch it"
+            )
+
+
+def _validated_https_url(url: str, *, what: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise OidcError(f"{what} must be an https:// URL, got {url!r}")
+    if not parsed.hostname:
+        raise OidcError(f"{what} has no host: {url!r}")
+    _reject_non_public_host(parsed.hostname)
+    return url
+
+
+def _safe_get(url: str, *, what: str) -> requests.Response:
+    """The one place this module makes an outbound HTTP request to an
+    admin-supplied host. Validates the URL, then explicitly refuses to
+    follow redirects: `_reject_non_public_host` only checked the address
+    behind the URL we were given, and requests() follows redirects by
+    default - so a validated public host redirecting to an internal one
+    would otherwise sail straight past this check on the second hop.
+    A real OIDC discovery/JWKS endpoint has no legitimate reason to
+    redirect; if one does, that's a configuration problem for whoever
+    owns that IdP to fix by pointing at the canonical URL, not something
+    to follow blindly.
+    """
+    _validated_https_url(url, what=what)
+    response = requests.get(url, timeout=_HTTP_TIMEOUT_SECONDS, allow_redirects=False)
+    if response.is_redirect:
+        raise OidcError(f"{what} at {url!r} returned a redirect, which is not followed")
+    response.raise_for_status()
+    return response
+
+
 def _discovery_document(issuer: str) -> dict:
     nowt = time.time()
     cached = _discovery_cache.get(issuer)
     if cached and cached[0] > nowt:
         return cached[1]
     url = issuer.rstrip("/") + "/.well-known/openid-configuration"
-    response = requests.get(url, timeout=_HTTP_TIMEOUT_SECONDS)
-    response.raise_for_status()
-    document = response.json()
+    document = _safe_get(url, what="OIDC discovery document").json()
+    if len(_discovery_cache) >= _DISCOVERY_CACHE_MAX_ENTRIES:
+        # Bounded because `issuer` is admin-supplied per-org input, not a
+        # fixed set of values - an unbounded cache keyed on it would let
+        # a stream of distinct issuer strings grow this dict without
+        # limit, the same class of problem the rate limiter's own
+        # max_keys guards against.
+        oldest_key = min(_discovery_cache, key=lambda k: _discovery_cache[k][0])
+        del _discovery_cache[oldest_key]
     _discovery_cache[issuer] = (nowt + _DISCOVERY_CACHE_TTL_SECONDS, document)
     return document
 
 
 def _jwks(jwks_uri: str) -> KeySet:
-    response = requests.get(jwks_uri, timeout=_HTTP_TIMEOUT_SECONDS)
-    response.raise_for_status()
+    response = _safe_get(jwks_uri, what="JWKS")
     return KeySet.import_key_set(response.json())
 
 
@@ -160,7 +242,34 @@ def google_login_available() -> bool:
 # Per-organization SSO
 # --------------------------------------------------------------------------
 
-def _oidc_client_secret(secret_ref: str) -> Optional[str]:
+def _oidc_client_secret(org_id: str, secret_ref: str) -> Optional[str]:
+    """Looks up a per-org SSO client secret.
+
+    Regression, found in a security self-review: MORTEMTRACE_OIDC_CLIENT_SECRETS
+    is one flat table shared by every tenant, and this used to be looked
+    up by `secret_ref` alone - a value an org's own admin chooses on the
+    SSO settings form (console/ui.py's /orgs/{org_id}/sso route), with no
+    check that the ref they typed actually belongs to their org. Any
+    self-registered admin (org creation is open to anyone with a Google
+    account) could type in another organization's ref and have MortemTrace
+    present that organization's real IdP client secret to whatever
+    `issuer`/token endpoint they configured - a live, working credential
+    handed to an attacker's own server.
+
+    The fix is structural, not a permission check: the lookup key is now
+    ALWAYS built here, from `org_id` supplied by the caller (which comes
+    from the signed OAuth handshake - see complete_login - never from
+    anything Firestore's `sso` document says about itself), concatenated
+    with whatever suffix the admin chose. An org can therefore only ever
+    reference secrets stored under ITS OWN org_id prefix, structurally -
+    there is no `secret_ref` value an admin could type that resolves to a
+    different tenant's entry, because the org_id half is never something
+    their input controls.
+
+    Operators populating MORTEMTRACE_OIDC_CLIENT_SECRETS out of band
+    (there is no in-app write path - see the secret's own docs) must key
+    each entry as f"{org_id}:{ref}", matching this lookup.
+    """
     raw = os.environ.get(_OIDC_CLIENT_SECRETS_ENV, "{}")
     try:
         table = json.loads(raw)
@@ -169,7 +278,7 @@ def _oidc_client_secret(secret_ref: str) -> Optional[str]:
         return None
     if not isinstance(table, dict):
         return None
-    return table.get(secret_ref)
+    return table.get(f"{org_id}:{secret_ref}")
 
 
 # --------------------------------------------------------------------------
@@ -283,7 +392,10 @@ def complete_login(*, query_params: dict, handshake_cookie: Optional[str], base_
         if org is None or not org.get("sso"):
             raise OidcError("this organization's SSO configuration is missing or was removed mid-login")
         sso = org["sso"]
-        secret = _oidc_client_secret(sso["client_secret_ref"])
+        # handshake.org_id, not anything read from `sso` or `org` -
+        # see _oidc_client_secret's docstring for why the org half of
+        # this lookup must come from code, not from stored data.
+        secret = _oidc_client_secret(handshake.org_id, sso["client_secret_ref"])
         if secret is None:
             raise OidcError(f"no secret configured for {sso['client_secret_ref']!r}")
         issuer, client_id, client_secret = sso["issuer"], sso["client_id"], secret

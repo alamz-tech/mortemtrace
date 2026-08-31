@@ -876,15 +876,28 @@ async def sso_settings_save(request: Request, org_id: str):
     issuer = str(form.get("issuer") or "").strip()
     client_id = str(form.get("client_id") or "").strip()
     client_secret_ref = str(form.get("client_secret_ref") or "").strip()
-    domain_hint = str(form.get("domain_hint") or "").strip().lower() or None
     if not (issuer.startswith("https://") and client_id and client_secret_ref):
         raise HTTPException(
             status_code=400,
             detail="issuer (https://...), client_id, and client_secret_ref are all required",
         )
 
+    # domain_hint is deliberately NOT settable here. Regression, found in
+    # a security self-review: it routes an email address's login flow to
+    # whichever organization's SSO config claims that domain
+    # (find_organization_by_sso_domain_hint), with no proof the claiming
+    # org actually owns that domain. Org creation is open to anyone with
+    # a Google account (see /onboarding), so a self-registered admin
+    # could previously claim any company's domain here and capture that
+    # company's employees' login attempts - a real, unauthenticated
+    # phishing primitive, not a theoretical one. Preserving whatever hint
+    # an existing config already carries (never introducing one from this
+    # form) until real domain-ownership verification (DNS TXT challenge
+    # or similar) exists; until then it's operator-set only, out of band.
+    existing_sso = (scope_store.get_organization(org_id) or {}).get("sso") or {}
     sso = OrgSsoConfig(
-        issuer=issuer, client_id=client_id, client_secret_ref=client_secret_ref, domain_hint=domain_hint,
+        issuer=issuer, client_id=client_id, client_secret_ref=client_secret_ref,
+        domain_hint=existing_sso.get("domain_hint"),
     )
     scope_store.set_organization_sso(principal.user_id, org_id, sso.model_dump(mode="json"))
     return RedirectResponse(url=f"/orgs/{org_id}/sso", status_code=303)

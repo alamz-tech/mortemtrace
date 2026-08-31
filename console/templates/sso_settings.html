@@ -45,14 +45,16 @@
       value is never entered here or stored in this document.
     </p>
 
-    <label for="domain_hint" class="muted" style="display:block; margin:0.7rem 0 0.3rem;">
-      Email domain
-    </label>
-    <input id="domain_hint" name="domain_hint" type="text"
-           value="{{ org.sso.domain_hint if org.sso else '' }}"
-           placeholder="acme.com"
-           style="width:100%; padding:0.55rem 0.7rem; background:var(--bg); color:var(--text);
-                  border:1px solid var(--border); border-radius:6px;">
+    <p class="muted" style="font-size:0.78rem; margin-top:0.3rem;">
+      Email domain routing:
+      {% if org.sso and org.sso.domain_hint %}
+        <span class="mono">{{ org.sso.domain_hint }}</span>
+      {% else %}
+        not set
+      {% endif %}
+      — set by a platform operator after verifying domain ownership, not from this form.
+      Contact your platform operator to configure or change it.
+    </p>
 
     <button type="submit"
             style="margin-top:1rem; padding:0.55rem 1.2rem; background:var(--accent);
