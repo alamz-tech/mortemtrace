@@ -99,6 +99,7 @@ _MAX_TEXT_PAYLOAD_BYTES = _FIRESTORE_MAX_DOC_BYTES - _DOC_OVERHEAD_BYTES
 
 otel_setup.init_telemetry("mortemtrace-ingest-api")
 otel_setup.configure_logging("mortemtrace-ingest-api")
+identity.enforce_production_secrets()
 identity.warn_if_open()
 wiring.register_all()
 

@@ -247,6 +247,63 @@ def warn_if_open() -> None:
         )
 
 
+_RUNNING_ON_CLOUD_RUN_ENV = "K_SERVICE"  # set automatically by Cloud Run, never by a developer
+
+
+def is_production_runtime() -> bool:
+    return bool(os.environ.get(_RUNNING_ON_CLOUD_RUN_ENV))
+
+
+def enforce_production_secrets() -> None:
+    """Refuses to start if a real signing secret is missing on Cloud Run.
+
+    data/scope_store.py, auth/session.py, and auth/oidc.py's HMAC
+    secrets each fall back to a hardcoded, publicly-known constant when
+    their env var is unset, logging a warning and continuing - the right
+    behavior for a laptop running `uvicorn --reload` with no Secret
+    Manager access, and a genuine hole on a real deployment: if
+    MORTEMTRACE_SESSION_SECRET (say) were ever missing - a Secret
+    Manager IAM regression, a partially-applied deploy, a new region -
+    the service would start up FINE and silently accept any session
+    cookie forged with a secret published in this repository's own
+    source. Found in a security self-review, not exploited in
+    production - the per-request fallback path never actually fired on
+    the live deployment.
+
+    Checked once, here, at process startup rather than per-request in
+    each `_secret()`: a hard crash on a missing secret is loud and
+    obvious in Cloud Run's own deploy/revision logs, exactly where an
+    operator would look after a bad deploy - a 401 or a subtly-forgeable
+    session on whichever request happened to call _secret() first would
+    not be.
+
+    Deliberately does not check MORTEMTRACE_OIDC_CLIENT_SECRETS: that
+    one is legitimately empty until an org configures its own SSO (see
+    infra/create_secrets.sh), not a secret every deployment needs from
+    the start.
+    """
+    if not is_production_runtime():
+        return  # local/dev: the per-module dev fallback is the correct behavior here
+
+    from auth import session as session_module
+    from data import scope_store
+
+    missing = [
+        env_name for env_name in (
+            scope_store._CLAIM_SECRET_ENV,
+            session_module._SESSION_SECRET_ENV,
+        )
+        if not os.environ.get(env_name)
+    ]
+    if missing:
+        raise RuntimeError(
+            f"Refusing to start on Cloud Run with {missing} unset - each would silently "
+            "fall back to a hardcoded, publicly-known secret, making every session/claim "
+            "forgeable. Set them via Secret Manager (see infra/create_secrets.sh) and "
+            "verify the runtime service account can actually read them."
+        )
+
+
 # --------------------------------------------------------------------------
 # Entry point used by the HTTP layers
 # --------------------------------------------------------------------------

@@ -41,9 +41,12 @@ docstring.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import os
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Optional
@@ -103,6 +106,7 @@ _TONE_BY_VALUE = {
 
 otel_setup.init_telemetry("mortemtrace-console")
 otel_setup.configure_logging("mortemtrace-console")
+identity.enforce_production_secrets()
 identity.warn_if_open()
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
@@ -177,6 +181,48 @@ _CONSOLE_LIMITER = identity.build_console_limiter()
 SESSION_COOKIE = "mortemtrace_session"
 _HANDSHAKE_COOKIE = "mortemtrace_oauth_handshake"
 _INVITE_QUERY_PARAM = "invite"
+_INVITE_FLASH_COOKIE = "mortemtrace_invite_flash"
+_INVITE_FLASH_TTL_SECONDS = 120
+
+
+def _pack_invite_flash(invite_link: str) -> str:
+    """Signs the just-created invite link for one-shot display on the
+    members page, without ever putting the raw invitation token in a URL.
+
+    Regression, found in a security self-review: the invite link used to
+    be passed as a query-string parameter on the post-create redirect
+    (?invite_link=...), which means the raw, unhashed token - possessing
+    it grants org membership to whoever holds it and has the matching
+    email, per auth/provisioning.py's _redeem_invite_if_valid - landed in
+    the browser's address bar, its history, and any Cloud Run/load-
+    balancer access log that records the request path. Invitation itself
+    correctly stores only a digest in Firestore; putting the plaintext in
+    a URL undid that.
+
+    Same primitive as auth/oidc.py's OAuth handshake cookie (a short-
+    lived, HMAC-signed value, no server-side store) - not a new
+    mechanism, the same trust root auth/session.py's secret already is.
+    """
+    payload = f"{int(time.time())}:{invite_link}"
+    signature = hmac.new(session_module._secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{payload}.{signature}"
+
+
+def _unpack_invite_flash(cookie_value: Optional[str]) -> Optional[str]:
+    if not cookie_value or "." not in cookie_value:
+        return None
+    payload, _, signature = cookie_value.rpartition(".")
+    expected = hmac.new(session_module._secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        return None
+    issued_at_raw, _, invite_link = payload.partition(":")
+    try:
+        issued_at = int(issued_at_raw)
+    except ValueError:
+        return None
+    if time.time() - issued_at > _INVITE_FLASH_TTL_SECONDS:
+        return None
+    return invite_link or None
 
 
 def _authenticate_request(authorization: Optional[str], request: Optional[Request]) -> identity.Principal:
@@ -765,13 +811,17 @@ def members_page(request: Request, org_id: str):
         m["_user"] = users_by_id.get(m["user_id"], {})
         m["_tone"] = "ok" if m.get("status") == "active" else "bad"
     members.sort(key=lambda m: (m.get("status") != "active", m.get("_user", {}).get("email", "")))
-    return templates.TemplateResponse(request, "members.html", {
+    last_invite_link = _unpack_invite_flash(request.cookies.get(_INVITE_FLASH_COOKIE))
+    response = templates.TemplateResponse(request, "members.html", {
         "org_id": org_id, "members": members,
         "acting_user_id": principal.user_id,
         "csrf_token": session_module.csrf_token(session),
-        "last_invite_link": request.query_params.get("invite_link"),
+        "last_invite_link": last_invite_link,
         **_header_context(principal, org_id),
     })
+    if last_invite_link is not None:
+        response.delete_cookie(_INVITE_FLASH_COOKIE, path="/")  # one-shot: shown once, then gone
+    return response
 
 
 @app.post("/orgs/{org_id}/invite")
@@ -789,12 +839,18 @@ async def invite_member(request: Request, org_id: str):
 
     _invitation, token = scope_store.create_invitation(principal.user_id, org_id, email, role)
     invite_link = f"{_base_url(request)}/invite/{token}"
-    # Shown once, in the redirect target's query string, then never again -
-    # there is no email-sending integration in this deployment, so the
+    # Shown once, via a short-lived signed cookie, then never again - not
+    # a URL query parameter, which would put the raw token in browser
+    # history and server access logs (see _pack_invite_flash's docstring).
+    # There is no email-sending integration in this deployment, so the
     # admin copies this link and shares it manually (Slack, email client).
-    return RedirectResponse(
-        url=f"/orgs/{org_id}/members?invite_link={invite_link}", status_code=303,
+    response = RedirectResponse(url=f"/orgs/{org_id}/members", status_code=303)
+    response.set_cookie(
+        _INVITE_FLASH_COOKIE, _pack_invite_flash(invite_link),
+        httponly=True, samesite="strict", secure=_secure_cookies(), path="/",
+        max_age=_INVITE_FLASH_TTL_SECONDS,
     )
+    return response
 
 
 @app.post("/orgs/{org_id}/members/{target_user_id}/revoke")

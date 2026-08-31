@@ -558,8 +558,16 @@ def test_oidc_callback_failure_redirects_to_login_and_clears_handshake(fake_db, 
 # --------------------------------------------------------------------------
 
 def _browser_for(user_id: str) -> TestClient:
+    # base_url is https, not TestClient's http:// default: every cookie
+    # this app sets carries Secure (see console/ui.py's _secure_cookies),
+    # and httpx's cookie jar correctly refuses to retain/resend a Secure
+    # cookie over a connection it thinks is plain http - matching a real
+    # browser. Multi-request flows that rely on the jar automatically
+    # carrying a cookie set by an earlier response (e.g. the invite-flash
+    # cookie) need this to behave like an actual browser session.
     return TestClient(
-        console_module.app, cookies={console_module.SESSION_COOKIE: mint_test_session_cookie(user_id)},
+        console_module.app, base_url="https://testserver",
+        cookies={console_module.SESSION_COOKIE: mint_test_session_cookie(user_id)},
     )
 
 
@@ -633,12 +641,47 @@ def test_admin_can_view_members_and_create_an_invite_link(fake_db):
         data={"email": "newhire@acme.com", "role": "member", "csrf_token": _csrf_for(TEST_USER)},
         follow_redirects=False,
     )
+
     assert resp.status_code == 303
-    assert "invite_link=" in resp.headers["location"]
+    assert resp.headers["location"] == f"/orgs/{TEST_ORG}/members"  # no token in the URL
 
     shown = browser.get(resp.headers["location"])
-    assert "newhire@acme.com" not in shown.text or "/invite/" in shown.text  # the link itself is shown
-    assert "/invite/" in shown.text
+    assert "/invite/" in shown.text  # the link itself is shown, once, via the flash cookie
+
+
+def test_invite_link_never_appears_in_the_redirect_location(fake_db):
+    """Regression: the raw invitation token used to be a query-string
+    parameter on this redirect (?invite_link=...), which put it in
+    browser history and any access log that records the request path -
+    the exact plaintext a token_hash-only Firestore record was meant to
+    avoid ever existing anywhere else."""
+    seed_membership(fake_db, TEST_USER, TEST_ORG, role="admin", email="admin@acme.com")
+
+    resp = _browser_for(TEST_USER).post(
+        f"/orgs/{TEST_ORG}/invite",
+        data={"email": "newhire@acme.com", "role": "member", "csrf_token": _csrf_for(TEST_USER)},
+        follow_redirects=False,
+    )
+
+    assert "invite_link" not in resp.headers["location"]
+    assert "/invite/" not in resp.headers["location"]
+    assert any(c.name == console_module._INVITE_FLASH_COOKIE for c in resp.cookies.jar)
+
+
+def test_invite_flash_is_shown_exactly_once(fake_db):
+    browser = _browser_for(TEST_USER)
+    seed_membership(fake_db, TEST_USER, TEST_ORG, role="admin", email="admin@acme.com")
+    resp = browser.post(
+        f"/orgs/{TEST_ORG}/invite",
+        data={"email": "newhire@acme.com", "role": "member", "csrf_token": _csrf_for(TEST_USER)},
+        follow_redirects=False,
+    )
+
+    first_view = browser.get(resp.headers["location"])
+    second_view = browser.get(resp.headers["location"])
+
+    assert "/invite/" in first_view.text
+    assert "/invite/" not in second_view.text
 
 
 def test_member_cannot_create_an_invite(fake_db):

@@ -345,3 +345,62 @@ def test_authorize_org_zero_memberships_gives_a_distinct_message():
     principal = identity.Principal(org_ids=frozenset(), subject="alice@example.com", method="session")
     with pytest.raises(identity.AuthorizationError, match="not a member of any organization"):
         principal.authorize_org(None)
+
+
+# --------------------------------------------------------------------------
+# Fail-closed on a missing production signing secret
+#
+# Regression, found in a security self-review: MORTEMTRACE_SESSION_SECRET
+# and MORTEMTRACE_CLAIM_SECRET each silently fall back to a hardcoded,
+# publicly-known constant when unset - correct for local dev, a real hole
+# on a genuine deployment (a Secret Manager IAM regression would start
+# fine and silently accept a forged session/claim signed with a secret
+# published in this repo's own source).
+# --------------------------------------------------------------------------
+
+def test_missing_secrets_are_tolerated_off_cloud_run(monkeypatch):
+    """Local dev (`uvicorn --reload`, no K_SERVICE) must not be forced to
+    configure Secret Manager just to run the app."""
+    monkeypatch.delenv("K_SERVICE", raising=False)
+    monkeypatch.delenv("MORTEMTRACE_SESSION_SECRET", raising=False)
+    monkeypatch.delenv("MORTEMTRACE_CLAIM_SECRET", raising=False)
+
+    identity.enforce_production_secrets()  # must not raise
+
+
+def test_missing_session_secret_on_cloud_run_refuses_to_start(monkeypatch):
+    monkeypatch.setenv("K_SERVICE", "mortemtrace-console")
+    monkeypatch.setenv("MORTEMTRACE_CLAIM_SECRET", "real-value")
+    monkeypatch.delenv("MORTEMTRACE_SESSION_SECRET", raising=False)
+
+    with pytest.raises(RuntimeError, match="MORTEMTRACE_SESSION_SECRET"):
+        identity.enforce_production_secrets()
+
+
+def test_missing_claim_secret_on_cloud_run_refuses_to_start(monkeypatch):
+    monkeypatch.setenv("K_SERVICE", "mortemtrace-ingest-api")
+    monkeypatch.setenv("MORTEMTRACE_SESSION_SECRET", "real-value")
+    monkeypatch.delenv("MORTEMTRACE_CLAIM_SECRET", raising=False)
+
+    with pytest.raises(RuntimeError, match="MORTEMTRACE_CLAIM_SECRET"):
+        identity.enforce_production_secrets()
+
+
+def test_both_secrets_present_on_cloud_run_starts_cleanly(monkeypatch):
+    monkeypatch.setenv("K_SERVICE", "mortemtrace-console")
+    monkeypatch.setenv("MORTEMTRACE_SESSION_SECRET", "real-session-value")
+    monkeypatch.setenv("MORTEMTRACE_CLAIM_SECRET", "real-claim-value")
+
+    identity.enforce_production_secrets()  # must not raise
+
+
+def test_missing_oidc_client_secrets_table_is_never_fatal(monkeypatch):
+    """MORTEMTRACE_OIDC_CLIENT_SECRETS is legitimately empty until an org
+    configures its own SSO - it must never be treated as a missing
+    required secret, unlike session/claim."""
+    monkeypatch.setenv("K_SERVICE", "mortemtrace-console")
+    monkeypatch.setenv("MORTEMTRACE_SESSION_SECRET", "real-value")
+    monkeypatch.setenv("MORTEMTRACE_CLAIM_SECRET", "real-value")
+    monkeypatch.delenv("MORTEMTRACE_OIDC_CLIENT_SECRETS", raising=False)
+
+    identity.enforce_production_secrets()  # must not raise
