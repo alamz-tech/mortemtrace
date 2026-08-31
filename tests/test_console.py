@@ -11,8 +11,19 @@ import pytest
 from fastapi.testclient import TestClient
 
 import console.ui as console_module
+from auth import oidc
 from data.models import Collection
-from tests.conftest import TEST_ORG, seed_agent
+from tests.conftest import (
+    OTHER_ORG,
+    OTHER_TOKEN,
+    TEST_ORG,
+    auth_header,
+    mint_test_session_cookie,
+    seed_agent,
+    seed_membership,
+)
+
+TEST_USER = "user_console_test"
 
 OTHER = "org_console_other"
 
@@ -28,7 +39,9 @@ def client(fake_db):
         ],
         write_scopes=[],
     )
-    return TestClient(console_module.app)
+    # Default headers carry a real token, so every existing assertion now
+    # runs through the genuine authentication path rather than around it.
+    return TestClient(console_module.app, headers=auth_header())
 
 
 def _seed_runs_and_incidents(fake_db):
@@ -146,8 +159,11 @@ def test_dashboard_renders_seeded_runs_and_active_incidents(client, fake_db):
     assert "inc_resolved" not in resp.text  # not status=open, must not appear
 
 
-def test_dashboard_uses_demo_org_env_var_when_query_param_omitted(client, fake_db, monkeypatch):
-    monkeypatch.setenv(console_module._DEMO_ORG_ENV, TEST_ORG)
+def test_dashboard_resolves_tenant_from_token_when_query_param_omitted(client, fake_db):
+    """A single-tenant credential resolves org_id implicitly. This
+    replaces a test that asserted the old behaviour - falling back to the
+    MORTEMTRACE_DEMO_ORG env var with no credential involved - which was
+    the unauthenticated default that made every tenant readable."""
     _seed_runs_and_incidents(fake_db)
 
     resp = client.get("/")
@@ -278,7 +294,7 @@ def test_incident_detail_404_for_unknown_incident(client, fake_db):
 
 
 def test_audit_log_shows_all_recent_entries_globally(client, fake_db):
-    incident_id = _seed_incident_full(fake_db, data_touched=True, with_clock=False)
+    _seed_incident_full(fake_db, data_touched=True, with_clock=False)
 
     resp = client.get("/audit", params={"org_id": TEST_ORG})
     text = resp.text
@@ -287,3 +303,512 @@ def test_audit_log_shows_all_recent_entries_globally(client, fake_db):
     assert "write granted" in text
     assert "comms has no read scope for raw_evidence" in text
     assert "draft_totally_unrelated" in text  # unlike the incident page, /audit is unfiltered
+
+
+# --------------------------------------------------------------------------
+# Cross-tenant access control
+#
+# The console was the confirmed-live vulnerability: GET /api/runs?org_id=<any>
+# returned 200 with no credential and no auth challenge, exposing every
+# tenant's incidents, drafts, GDPR clocks and audit log to anyone with the URL.
+# --------------------------------------------------------------------------
+
+def test_dashboard_without_credential_is_rejected(fake_db):
+    resp = TestClient(console_module.app).get("/", params={"org_id": TEST_ORG})
+    assert resp.status_code == 401
+
+
+def test_api_runs_without_credential_is_rejected(fake_db):
+    resp = TestClient(console_module.app).get("/api/runs", params={"org_id": TEST_ORG})
+    assert resp.status_code == 401
+
+
+def test_audit_log_without_credential_is_rejected(fake_db):
+    resp = TestClient(console_module.app).get("/audit", params={"org_id": TEST_ORG})
+    assert resp.status_code == 401
+
+
+def test_browser_navigation_without_credential_redirects_to_login(fake_db):
+    """A browser navigation gets the login form, not a bare JSON 401 -
+    otherwise the first thing an operator sees on a protected console is
+    an error with no indication that /login exists."""
+    resp = TestClient(console_module.app).get(
+        "/", headers={"Accept": "text/html,application/xhtml+xml"}, follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/login"
+
+
+def test_json_client_without_credential_still_gets_401_not_a_redirect(fake_db):
+    """The dashboard's own polling fetch must keep receiving a real 401 so
+    its handler can send the user to /login. If this redirected, the poll
+    would parse the login page's HTML as run data and render nothing,
+    leaving a frozen table that still looks live."""
+    resp = TestClient(console_module.app).get(
+        "/api/runs", headers={"Accept": "application/json"}, follow_redirects=False,
+    )
+
+    assert resp.status_code == 401
+
+
+def test_browser_cross_tenant_request_is_403_not_a_login_redirect(fake_db):
+    """403 must not be swept into the 401 redirect path: the caller is
+    authenticated, and bouncing them to a login form would suggest a
+    credential problem rather than a tenant boundary."""
+    seed_membership(fake_db, TEST_USER, TEST_ORG)
+    browser = TestClient(
+        console_module.app,
+        cookies={console_module.SESSION_COOKIE: mint_test_session_cookie(TEST_USER)},
+    )
+
+    resp = browser.get(
+        "/", params={"org_id": OTHER_ORG},
+        headers={"Accept": "text/html"}, follow_redirects=False,
+    )
+
+    assert resp.status_code == 403
+
+
+def test_cannot_read_another_tenants_runs(client, fake_db):
+    _seed_runs_and_incidents(fake_db)
+
+    resp = client.get("/api/runs", params={"org_id": OTHER_ORG})
+
+    assert resp.status_code == 403
+
+
+def test_cannot_read_another_tenants_incident(client, fake_db):
+    incident_id = _seed_incident_full(fake_db, data_touched=True, with_clock=True)
+
+    resp = client.get(f"/incidents/{incident_id}", params={"org_id": OTHER_ORG})
+
+    assert resp.status_code == 403
+
+
+def test_other_tenants_token_sees_none_of_this_tenants_data(fake_db):
+    """Positive control for the negative tests above: a *valid* credential
+    for a different tenant authenticates fine and simply sees nothing,
+    rather than being rejected for the wrong reason."""
+    _seed_runs_and_incidents(fake_db)
+    seed_agent(
+        fake_db, console_module.CONSOLE_AGENT_NAME, console_module.CONSOLE_AGENT_VERSION,
+        read_scopes=[Collection.RUNS, Collection.INCIDENTS], write_scopes=[],
+    )
+    other = TestClient(console_module.app, headers=auth_header(OTHER_TOKEN))
+
+    resp = other.get("/api/runs")
+
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_status_stays_open(fake_db):
+    """A liveness probe requiring a credential cannot distinguish "down"
+    from "credential misconfigured" - exactly when you need it most."""
+    assert TestClient(console_module.app).get("/status").status_code == 200
+
+
+def test_session_cookie_authenticates_browser_requests(client, fake_db):
+    """A session cookie is a MortemTrace-minted token, never the raw
+    credential itself - it only resolves to org access via a live
+    Membership row, which is what this test actually seeds and checks."""
+    _seed_runs_and_incidents(fake_db)
+    seed_membership(fake_db, TEST_USER, TEST_ORG)
+    browser = TestClient(
+        console_module.app,
+        cookies={console_module.SESSION_COOKIE: mint_test_session_cookie(TEST_USER)},
+    )
+
+    resp = browser.get("/")
+
+    assert resp.status_code == 200
+    assert "inc_open" in resp.text
+
+
+def test_session_cookie_for_user_with_no_membership_sees_nothing(fake_db):
+    """A validly-signed session for a real user who simply isn't a member
+    of anything yet must land on onboarding, not be treated as a 403 or,
+    worse, resolved to some default tenant."""
+    browser = TestClient(
+        console_module.app,
+        cookies={console_module.SESSION_COOKIE: mint_test_session_cookie(TEST_USER)},
+    )
+
+    resp = browser.get("/", follow_redirects=False)
+
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/onboarding"
+
+
+def test_bad_session_cookie_is_rejected(fake_db):
+    browser = TestClient(console_module.app, cookies={console_module.SESSION_COOKIE: "nope"})
+    assert browser.get("/").status_code == 401
+
+
+def test_stale_session_cookie_is_cleared_so_the_browser_can_recover(fake_db):
+    """Regression: a browser holding an unusable session cookie (minted
+    by a previous deployment, or before the session secret existed) got
+    stuck in a permanent loop - /auth/callback would set a good cookie,
+    but the stale one kept losing verification on every following
+    request, bouncing back to /login with no way for the user to break
+    out short of manually clearing site data. Expiring the bad cookie on
+    the way out makes the next attempt self-heal."""
+    browser = TestClient(console_module.app, cookies={console_module.SESSION_COOKIE: "stale-garbage"})
+
+    resp = browser.get("/", headers={"Accept": "text/html"}, follow_redirects=False)
+
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/login"
+    set_cookie = resp.headers.get("set-cookie", "")
+    assert console_module.SESSION_COOKIE in set_cookie
+    # Max-Age=0 is what actually expires it; asserting the name alone
+    # would pass even if we accidentally re-set a live cookie here.
+    assert "max-age=0" in set_cookie.lower()
+
+
+def test_json_client_with_stale_cookie_gets_401_without_a_redirect(fake_db):
+    """The clearing behaviour above must not leak into the API path -
+    the dashboard's polling fetch still needs a real 401 to react to."""
+    browser = TestClient(console_module.app, cookies={console_module.SESSION_COOKIE: "stale-garbage"})
+
+    resp = browser.get("/api/runs", headers={"Accept": "application/json"}, follow_redirects=False)
+
+    assert resp.status_code == 401
+
+
+def test_login_form_offers_google_and_no_password_field(fake_db, monkeypatch):
+    monkeypatch.setenv("MORTEMTRACE_GOOGLE_OAUTH_CLIENT_ID", "test-client-id")
+    monkeypatch.setenv("MORTEMTRACE_GOOGLE_OAUTH_CLIENT_SECRET", "test-client-secret")
+    resp = TestClient(console_module.app).get("/login")
+    assert resp.status_code == 200
+    assert "/auth/login/google" in resp.text
+    assert 'type="password"' not in resp.text
+
+
+def test_login_org_with_unconfigured_domain_redirects_with_error(fake_db):
+    """No org has claimed this domain for SSO - the caller is told
+    plainly rather than silently falling through to something else."""
+    resp = TestClient(console_module.app).post(
+        "/auth/login/org", data={"email": "person@no-such-company.example"}, follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"].startswith("/login?error=")
+
+
+def test_oidc_callback_sets_a_hardened_session_cookie(fake_db, monkeypatch):
+    """The real OIDC code/JWKS exchange is exercised directly in
+    tests/test_oidc.py; here the boundary under test is console/ui.py's
+    own handling of a *successful, already-verified* identity - so
+    oidc.complete_login is monkeypatched to return one, the same
+    boundary-substitution pattern stub_gateway uses for the model call."""
+    monkeypatch.setattr(
+        oidc, "complete_login",
+        lambda **kwargs: oidc.VerifiedIdentity(
+            issuer=oidc.GOOGLE_ISSUER, subject="google-sub-123", email="alice@example.com",
+            display_name="Alice", invite_token=None, demo=False,
+        ),
+    )
+
+    resp = TestClient(console_module.app).get(
+        "/auth/callback", params={"code": "irrelevant", "state": "irrelevant"},
+        cookies={console_module._HANDSHAKE_COOKIE: "irrelevant"},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/onboarding"  # brand-new user, no org yet
+    set_cookie = resp.headers["set-cookie"].lower()
+    assert console_module.SESSION_COOKIE.lower() in set_cookie
+    assert "httponly" in set_cookie
+    # Lax, NOT Strict. Regression: this assertion previously demanded
+    # Strict, which made a completely broken login flow look correct in
+    # CI. /auth/callback is reached as a top-level navigation from
+    # accounts.google.com, and Strict makes the browser withhold the
+    # cookie on exactly that inbound cross-site navigation - so the
+    # cookie was set and then never sent back, and every real browser
+    # login bounced straight to /login. TestClient (like curl) does not
+    # implement SameSite, so no request-level test can catch this;
+    # asserting the attribute directly is the only guard available here.
+    assert "samesite=lax" in set_cookie
+    assert "samesite=strict" not in set_cookie
+
+
+def test_oidc_callback_failure_redirects_to_login_and_clears_handshake(fake_db, monkeypatch):
+    monkeypatch.setattr(
+        oidc, "complete_login",
+        lambda **kwargs: (_ for _ in ()).throw(oidc.OidcError("state mismatch")),
+    )
+
+    resp = TestClient(console_module.app).get(
+        "/auth/callback", params={"code": "x", "state": "x"},
+        cookies={console_module._HANDSHAKE_COOKIE: "irrelevant"},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    assert resp.headers["location"].startswith("/login?error=")
+    assert console_module.SESSION_COOKIE not in resp.cookies
+
+
+# --------------------------------------------------------------------------
+# Onboarding, org administration, and CSRF - the console HTTP layer over
+# the identity/membership functions unit-tested directly in
+# tests/test_identity_provisioning.py.
+# --------------------------------------------------------------------------
+
+def _browser_for(user_id: str) -> TestClient:
+    return TestClient(
+        console_module.app, cookies={console_module.SESSION_COOKIE: mint_test_session_cookie(user_id)},
+    )
+
+
+def _csrf_for(user_id: str) -> str:
+    from auth import session as session_module
+    return session_module.csrf_token(session_module.verify_session(mint_test_session_cookie(user_id)))
+
+
+def test_onboarding_redirects_away_once_a_member_of_something(fake_db):
+    seed_membership(fake_db, TEST_USER, TEST_ORG)
+    resp = _browser_for(TEST_USER).get("/onboarding", follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/"
+
+
+def test_onboarding_post_creates_org_and_makes_creator_admin(fake_db):
+    browser = _browser_for(TEST_USER)
+    resp = browser.post(
+        "/onboarding", data={"display_name": "New Co", "csrf_token": _csrf_for(TEST_USER)},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"].startswith("/?org_id=org_")
+
+    new_org_id = resp.headers["location"].split("org_id=")[1]
+    from data import scope_store
+    assert scope_store.get_membership(TEST_USER, new_org_id)["role"] == "admin"
+
+
+def test_onboarding_post_without_csrf_token_is_rejected(fake_db):
+    resp = _browser_for(TEST_USER).post(
+        "/onboarding", data={"display_name": "New Co"}, follow_redirects=False,
+    )
+    assert resp.status_code == 403
+
+
+def test_onboarding_post_with_another_users_csrf_token_is_rejected(fake_db):
+    """The CSRF token is bound to the session it was issued for - one
+    authenticated user's token must not validate a different session,
+    even though both are otherwise-valid, currently-live sessions."""
+    resp = _browser_for(TEST_USER).post(
+        "/onboarding", data={"display_name": "New Co", "csrf_token": _csrf_for("user_someone_else")},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 403
+
+
+def test_non_admin_cannot_view_members_page(fake_db):
+    seed_membership(fake_db, TEST_USER, TEST_ORG, role="member")
+    resp = _browser_for(TEST_USER).get(f"/orgs/{TEST_ORG}/members")
+    assert resp.status_code == 403
+
+
+def test_non_member_cannot_view_members_page(fake_db):
+    """Not merely 'not an admin' - not a member AT ALL. Must be denied
+    the same as any other org's data, not treated as a special case."""
+    resp = _browser_for(TEST_USER).get(f"/orgs/{TEST_ORG}/members")
+    assert resp.status_code == 403
+
+
+def test_admin_can_view_members_and_create_an_invite_link(fake_db):
+    seed_membership(fake_db, TEST_USER, TEST_ORG, role="admin", email="admin@acme.com")
+    browser = _browser_for(TEST_USER)
+
+    page = browser.get(f"/orgs/{TEST_ORG}/members")
+    assert page.status_code == 200
+    assert "admin@acme.com" in page.text
+
+    resp = browser.post(
+        f"/orgs/{TEST_ORG}/invite",
+        data={"email": "newhire@acme.com", "role": "member", "csrf_token": _csrf_for(TEST_USER)},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "invite_link=" in resp.headers["location"]
+
+    shown = browser.get(resp.headers["location"])
+    assert "newhire@acme.com" not in shown.text or "/invite/" in shown.text  # the link itself is shown
+    assert "/invite/" in shown.text
+
+
+def test_member_cannot_create_an_invite(fake_db):
+    seed_membership(fake_db, TEST_USER, TEST_ORG, role="member")
+    resp = _browser_for(TEST_USER).post(
+        f"/orgs/{TEST_ORG}/invite",
+        data={"email": "x@acme.com", "role": "admin", "csrf_token": _csrf_for(TEST_USER)},
+    )
+    assert resp.status_code == 403
+
+
+def test_member_cannot_escalate_self_to_admin_via_invite_role(fake_db):
+    """A member POSTing role=admin to the invite endpoint must be denied
+    by the SAME admin check as any other invite - there is no separate,
+    weaker path for self-service role changes."""
+    seed_membership(fake_db, TEST_USER, TEST_ORG, role="member")
+    resp = _browser_for(TEST_USER).post(
+        f"/orgs/{TEST_ORG}/invite",
+        data={"email": "someone@acme.com", "role": "admin", "csrf_token": _csrf_for(TEST_USER)},
+    )
+    assert resp.status_code == 403
+
+
+def test_data_layer_permission_denied_surfaces_as_403_not_500(fake_db, monkeypatch):
+    """Regression: a PermissionDenied raised by scope_store's OWN
+    admin re-check (defense in depth against a role-revoked-mid-request
+    race) must map to a clean 403 - without the exception handler, this
+    was an unhandled 500."""
+    from data import scope_store
+    seed_membership(fake_db, TEST_USER, TEST_ORG, role="admin")
+
+    def _always_denies(*args, **kwargs):
+        raise scope_store.PermissionDenied("simulated role-revoked-mid-request race")
+    monkeypatch.setattr(scope_store, "create_invitation", _always_denies)
+
+    resp = _browser_for(TEST_USER).post(
+        f"/orgs/{TEST_ORG}/invite",
+        data={"email": "x@acme.com", "role": "member", "csrf_token": _csrf_for(TEST_USER)},
+    )
+    assert resp.status_code == 403
+
+
+def test_admin_can_revoke_a_member(fake_db):
+    seed_membership(fake_db, TEST_USER, TEST_ORG, role="admin")
+    seed_membership(fake_db, "user_departing", TEST_ORG, role="member")
+
+    resp = _browser_for(TEST_USER).post(
+        f"/orgs/{TEST_ORG}/members/user_departing/revoke",
+        data={"csrf_token": _csrf_for(TEST_USER)}, follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    from data import scope_store
+    assert scope_store.get_membership("user_departing", TEST_ORG) is None
+
+
+def test_admin_cannot_revoke_the_only_admin_via_http(fake_db):
+    """The scope_store-level LastAdminError must surface as a clean 400
+    through the console, not an unhandled 500."""
+    seed_membership(fake_db, TEST_USER, TEST_ORG, role="admin")
+
+    resp = _browser_for(TEST_USER).post(
+        f"/orgs/{TEST_ORG}/members/{TEST_USER}/revoke",
+        data={"csrf_token": _csrf_for(TEST_USER)},
+    )
+
+    assert resp.status_code == 400
+    from data import scope_store
+    assert scope_store.get_membership(TEST_USER, TEST_ORG) is not None
+
+
+def test_admin_can_promote_a_member_to_admin(fake_db):
+    seed_membership(fake_db, TEST_USER, TEST_ORG, role="admin")
+    seed_membership(fake_db, "user_promoted", TEST_ORG, role="member")
+
+    resp = _browser_for(TEST_USER).post(
+        f"/orgs/{TEST_ORG}/members/user_promoted/role",
+        data={"role": "admin", "csrf_token": _csrf_for(TEST_USER)}, follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    from data import scope_store
+    assert scope_store.get_membership("user_promoted", TEST_ORG)["role"] == "admin"
+
+
+def test_member_cannot_change_anyones_role(fake_db):
+    seed_membership(fake_db, TEST_USER, TEST_ORG, role="member")
+    seed_membership(fake_db, "user_other", TEST_ORG, role="member")
+
+    resp = _browser_for(TEST_USER).post(
+        f"/orgs/{TEST_ORG}/members/user_other/role",
+        data={"role": "admin", "csrf_token": _csrf_for(TEST_USER)},
+    )
+
+    assert resp.status_code == 403
+
+
+def test_sso_settings_admin_only(fake_db):
+    seed_membership(fake_db, TEST_USER, TEST_ORG, role="member")
+    resp = _browser_for(TEST_USER).get(f"/orgs/{TEST_ORG}/sso")
+    assert resp.status_code == 403
+
+
+def test_sso_settings_save_and_clear(fake_db):
+    seed_membership(fake_db, TEST_USER, TEST_ORG, role="admin")
+    fake_db.seed(f"organizations/{TEST_ORG}", {
+        "org_id": TEST_ORG, "display_name": "Test Org", "created_at": "2026-01-01T00:00:00+00:00",
+        "created_by": TEST_USER, "sso": None, "auto_join_domains": [], "public_demo_auto_join": False,
+    })
+    browser = _browser_for(TEST_USER)
+
+    resp = browser.post(
+        f"/orgs/{TEST_ORG}/sso",
+        data={
+            "action": "save", "issuer": "https://login.microsoftonline.com/tenant/v2.0",
+            "client_id": "client-123", "client_secret_ref": "acme-secret", "domain_hint": "acme.com",
+            "csrf_token": _csrf_for(TEST_USER),
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    from data import scope_store
+    org = scope_store.get_organization(TEST_ORG)
+    assert org["sso"]["issuer"] == "https://login.microsoftonline.com/tenant/v2.0"
+
+    clear_resp = browser.post(
+        f"/orgs/{TEST_ORG}/sso", data={"action": "clear", "csrf_token": _csrf_for(TEST_USER)},
+    )
+    assert clear_resp.status_code in (200, 303)
+    assert scope_store.get_organization(TEST_ORG)["sso"] is None
+
+
+def test_sso_settings_rejects_a_non_https_issuer(fake_db):
+    """An http:// (or otherwise non-https) issuer would send credentials
+    over plaintext during the OIDC handshake - rejected outright rather
+    than accepted and failing confusingly later."""
+    seed_membership(fake_db, TEST_USER, TEST_ORG, role="admin")
+    resp = _browser_for(TEST_USER).post(
+        f"/orgs/{TEST_ORG}/sso",
+        data={
+            "action": "save", "issuer": "http://insecure.example.com",
+            "client_id": "x", "client_secret_ref": "y", "csrf_token": _csrf_for(TEST_USER),
+        },
+    )
+    assert resp.status_code == 400
+
+
+def test_invite_link_redemption_creates_membership(fake_db):
+    from data import scope_store
+    seed_membership(fake_db, TEST_USER, TEST_ORG, role="admin")
+    _invitation, token = scope_store.create_invitation(TEST_USER, TEST_ORG, "newhire@acme.com", "member")
+
+    resp = _browser_for("user_newhire").get(f"/invite/{token}", follow_redirects=False)
+
+    # The redeeming session's email ("person@example.com" per seed_membership's
+    # default) does not match the invitation's email, so redemption must be
+    # refused - this proves the route enforces the same email-match rule
+    # tests/test_identity_provisioning.py already proved at the function level.
+    assert resp.status_code == 303
+    assert "error" in resp.headers["location"]
+    assert scope_store.get_membership("user_newhire", TEST_ORG) is None
+
+
+def test_invite_link_without_a_session_redirects_through_login(fake_db):
+    from data import scope_store
+    seed_membership(fake_db, TEST_USER, TEST_ORG, role="admin")
+    _invitation, token = scope_store.create_invitation(TEST_USER, TEST_ORG, "newhire@acme.com", "member")
+
+    resp = TestClient(console_module.app).get(f"/invite/{token}", follow_redirects=False)
+
+    assert resp.status_code == 303
+    assert resp.headers["location"] == f"/login?invite={token}"

@@ -70,12 +70,7 @@ def _on_timeline_committed(claim: OrgClaim, incident_id: str) -> RunResult:
     # structurally unable to see log content," and it produces the
     # audit-log denial entry the demo shows on camera (SPEC section 10,
     # beat 2).
-    log_detail = scope_store.try_read(claim, Collection.RAW_EVIDENCE, incident_id)
-    if log_detail is not None:
-        logger.warning(
-            "compliance unexpectedly read raw_evidence for incident %s - "
-            "scope misconfiguration? ignoring the content regardless.", incident_id,
-        )
+    scope_store.demo_scope_proof(claim, Collection.RAW_EVIDENCE, incident_id)
     # Nothing to draft yet - classification hasn't happened. The real
     # work (the GDPR assessment and the 72-hour clock) happens below on
     # incident.classified. This dispatch's only job is the denial proof.

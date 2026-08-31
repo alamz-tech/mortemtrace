@@ -127,8 +127,22 @@ def _local_screen_output(text: str) -> ArmorResult:
 # Real Model Armor
 # --------------------------------------------------------------------------
 
+class ModelArmorNotConfigured(RuntimeError):
+    """GOOGLE_CLOUD_PROJECT is unset, so the real API cannot be addressed."""
+
+
 def _template_name() -> str:
-    project = os.environ["GOOGLE_CLOUD_PROJECT"]
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    if not project:
+        # Raised as a named type rather than a bare KeyError so the
+        # fallback path can log "misconfigured" distinctly from "the API
+        # call failed". Both still fall back to local screening, but a
+        # permanently-misconfigured deployment silently running on regex
+        # heuristics while believing it has Model Armor is exactly the
+        # kind of thing that should be loud.
+        raise ModelArmorNotConfigured(
+            "GOOGLE_CLOUD_PROJECT is not set; cannot address a Model Armor template"
+        )
     return f"projects/{project}/locations/{_LOCATION}/templates/{_TEMPLATE_ID}"
 
 
@@ -172,10 +186,18 @@ def screen_input(text: str, *, run_id: str, org_id: str, agent_name: str) -> Arm
         )
         response = client.sanitize_user_prompt(request=request)
         remote = _interpret(response.sanitization_result, text, is_input=True)
+    except ModelArmorNotConfigured as exc:
+        logger.error(
+            "Model Armor is not configured (%s); input screening is running on local "
+            "heuristics only. This is a configuration failure, not a transient outage.",
+            exc, extra={"run_id": run_id, "org_id": org_id, "agent_name": agent_name},
+        )
+        return _local_screen_input(text)
     except Exception:
         logger.warning(
             "Model Armor input screen unavailable (agent=%s run=%s), using local fallback",
             agent_name, run_id, exc_info=True,
+            extra={"run_id": run_id, "org_id": org_id, "agent_name": agent_name},
         )
         return _local_screen_input(text)
 
@@ -207,10 +229,18 @@ def screen_output(text: str, *, run_id: str, org_id: str, agent_name: str) -> Ar
         )
         response = client.sanitize_model_response(request=request)
         remote = _interpret(response.sanitization_result, text, is_input=False)
+    except ModelArmorNotConfigured as exc:
+        logger.error(
+            "Model Armor is not configured (%s); output screening is running on local "
+            "heuristics only. This is a configuration failure, not a transient outage.",
+            exc, extra={"run_id": run_id, "org_id": org_id, "agent_name": agent_name},
+        )
+        return _local_screen_output(text)
     except Exception:
         logger.warning(
             "Model Armor output screen unavailable (agent=%s run=%s), using local fallback",
             agent_name, run_id, exc_info=True,
+            extra={"run_id": run_id, "org_id": org_id, "agent_name": agent_name},
         )
         return _local_screen_output(text)
 

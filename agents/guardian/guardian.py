@@ -31,12 +31,24 @@ class PreflightVerdict:
 
 
 def preflight(guardian_claim: OrgClaim, envelope: Envelope) -> PreflightVerdict:
-    """Screens the envelope's raw payload text before dispatch. Pasted
-    log lines are the highest-risk surface (R8): an attacker who can
-    write to your logs can write to your incident agent's prompt, and
-    this catches it even for a worker that reasons purely with tools and
-    never makes it to a model call on a bad path."""
-    raw_text = _flatten_payload_text(envelope.payload)
+    """Screens the evidence a dispatch is about to act on, before the
+    worker is invoked. Pasted log lines are the highest-risk surface
+    (R8): an attacker who can write to your logs can write to your
+    incident agent's prompt, and this catches it even for a worker that
+    reasons purely with tools and never reaches a model call.
+
+    Resolves `raw_evidence_id` and screens the stored evidence body.
+    Screening only the envelope payload - which is what this did - was a
+    no-op on every route in the system: every payload shape
+    (EvidenceReceived, EvidenceStaged, TimelineCommitted,
+    IncidentClassified) carries ids and metadata only, never the evidence
+    text, which lives in Firestore under raw_evidence_id. So this
+    function screened run_id, org_id and kind, found nothing, and
+    reported itself as a working defence-in-depth layer while providing
+    no depth at all. Injection was caught solely by the gateway's
+    before-model callback, one layer later.
+    """
+    raw_text = _evidence_text(guardian_claim, envelope)
     if not raw_text:
         return PreflightVerdict(allowed=True)
 
@@ -73,5 +85,48 @@ def _escalate(guardian_claim: OrgClaim, envelope: Envelope, *, alert_type: str, 
     scope_store.write(guardian_claim, Collection.ALERTS, alert.alert_id, alert.model_dump(mode="json"))
 
 
-def _flatten_payload_text(payload: dict) -> str:
-    return "\n".join(v for v in payload.values() if isinstance(v, str))
+# Envelope payload keys that can carry free text originating outside the
+# system. Everything else in every payload shape is a system-generated
+# identifier or timestamp.
+#
+# This is an allowlist rather than "every string value in the payload",
+# which is what it used to be. That version screened run_id, org_id,
+# incident_id and committed_at on every dispatch - and since
+# `timeline.committed` fans out to six agents, it meant six Model Armor
+# calls per incident spent evaluating our own UUIDs for prompt injection.
+# Paid, slow, and incapable of ever matching anything.
+_FREE_TEXT_PAYLOAD_KEYS = frozenset({"question", "detail", "reason", "note"})
+
+
+def _evidence_text(guardian_claim: OrgClaim, envelope: Envelope) -> str:
+    """The actual attacker-controlled content for this dispatch.
+
+    Resolves the referenced RawEvidence body - the part that matters,
+    since that is what a person pasted - plus any known free-text payload
+    field. Uses try_read so a missing scope or a deleted document degrades
+    to "screen what we can" rather than failing the dispatch: Guardian
+    must not become a new way for a run to die.
+    """
+    parts: list[str] = []
+
+    raw_evidence_id = envelope.payload.get("raw_evidence_id")
+    if raw_evidence_id:
+        raw = scope_store.try_read(guardian_claim, Collection.RAW_EVIDENCE, raw_evidence_id)
+        if raw:
+            payload = raw.get("payload")
+            # A base64 data: URI is an image, not prose - screening it
+            # spends a Model Armor call on content the text filters cannot
+            # meaningfully evaluate.
+            if isinstance(payload, str) and not payload.startswith("data:"):
+                parts.append(payload)
+        else:
+            logger.debug(
+                "guardian could not read raw_evidence %s for run %s; screening payload only",
+                raw_evidence_id, envelope.run_id,
+            )
+
+    parts.extend(
+        value for key, value in envelope.payload.items()
+        if key in _FREE_TEXT_PAYLOAD_KEYS and isinstance(value, str)
+    )
+    return "\n".join(p for p in parts if p)

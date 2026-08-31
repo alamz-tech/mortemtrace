@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Sign in — MortemTrace{% endblock %}
+{% block content %}
+<div class="card" style="max-width: 460px; margin: 3rem auto;">
+  <h1>MortemTrace</h1>
+  <p class="muted">Operator console.</p>
+  {% if error %}
+  <p class="badge tone-bad" style="display:block; padding: 0.5rem 0.75rem; margin: 0.9rem 0;">
+    {{ error }}
+  </p>
+  {% endif %}
+
+  {% if google_available %}
+  <a href="/auth/login/google{% if invite_token %}?invite={{ invite_token }}{% endif %}"
+     style="display:block; text-align:center; margin-top:1rem; padding:0.6rem;
+            background:var(--accent); color:#04121f; border-radius:6px;
+            font-weight:700; text-decoration:none;">
+    Continue with Google
+  </a>
+  {% else %}
+  <p class="muted" style="margin-top:1rem;">Google sign-in is not configured on this deployment.</p>
+  {% endif %}
+
+  <div style="display:flex; align-items:center; gap:0.75rem; margin:1.1rem 0; color:var(--muted);">
+    <div style="flex:1; height:1px; background:var(--border);"></div>
+    <span style="font-size:0.78rem;">or</span>
+    <div style="flex:1; height:1px; background:var(--border);"></div>
+  </div>
+
+  <form method="post" action="/auth/login/org">
+    {% if invite_token %}<input type="hidden" name="invite" value="{{ invite_token }}">{% endif %}
+    <label for="email" class="muted" style="display:block; margin-bottom:0.35rem;">
+      Continue with your company sign-in
+    </label>
+    <input id="email" name="email" type="email" placeholder="you@company.com" required
+           style="width:100%; padding:0.55rem 0.7rem; background:var(--bg); color:var(--text);
+                  border:1px solid var(--border); border-radius:6px;">
+    <button type="submit"
+            style="margin-top:0.7rem; width:100%; padding:0.55rem; background:none;
+                   color:var(--text); border:1px solid var(--border); border-radius:6px;
+                   font-weight:600; cursor:pointer;">
+      Continue
+    </button>
+  </form>
+
+  <p class="muted" style="margin-top:1.3rem; font-size:0.82rem; text-align:center;">
+    Just here to look around? <a href="/login/demo" style="color:var(--accent);">View the live demo</a>
+    — synthetic data only, no account needed.
+  </p>
+</div>
+{% endblock %}

@@ -38,21 +38,13 @@ def run(claim: OrgClaim, envelope: Envelope) -> RunResult:
 
     timeline = scope_store.read(claim, Collection.TIMELINE, incident_id)
 
-    # Comms' registry scope does not include raw_evidence. This call is
-    # expected to always be denied - that is the point. It is what turns
-    # "Comms happens not to show logs" into "Comms is structurally unable
-    # to show logs," and it is what produces the audit-log denial entry
-    # the demo shows on camera (SPEC section 10, beat 2).
-    log_detail = scope_store.try_read(claim, Collection.RAW_EVIDENCE, incident_id)
-    # try_read returns None here every time in practice, since Comms is
-    # never granted that scope - don't branch on it succeeding, just
-    # don't crash (and don't use the content) if scopes are ever
-    # misconfigured and it doesn't.
-    if log_detail is not None:
-        logger.warning(
-            "comms unexpectedly read raw_evidence for incident %s - scope "
-            "misconfiguration? ignoring the content regardless.", incident_id,
-        )
+    # Comms' registry scope does not include raw_evidence. Demo-only:
+    # deliberately walk into that boundary so the denial appears in
+    # /audit on camera (SPEC section 10, beat 2). Gated behind
+    # MORTEMTRACE_DEMO_SCOPE_PROOFS - what makes "Comms is structurally
+    # unable to show logs" true is _authorize(), not this call, so
+    # production skips the extra registry lookup and audit write.
+    scope_store.demo_scope_proof(claim, Collection.RAW_EVIDENCE, incident_id)
 
     if not timeline or not timeline.get("entries"):
         return RunResult(status="dead_letter", detail="no committed timeline entries to draft from")

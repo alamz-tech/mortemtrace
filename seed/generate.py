@@ -46,6 +46,7 @@ from data.models import (
     Customer,
     Incident,
     IncidentEvent,
+    Organization,
     RawEvidence,
     Service,
     SlaTerms,
@@ -238,9 +239,22 @@ def _incident_3_bundle(claim_org: str):
 # Write
 # --------------------------------------------------------------------------
 
-def generate(org_id: str = DEMO_ORG_ID_DEFAULT) -> dict:
+def generate(org_id: str = DEMO_ORG_ID_DEFAULT, *, public_demo: bool = False) -> dict:
     written = {"services": 0, "customers": 0, "incidents": 0, "raw_evidence": 0, "events": 0,
                "timelines": 0, "classifications": 0}
+
+    if public_demo:
+        # The one organization a Devpost judge (or anyone else without a
+        # provisioned account) may join with nothing but "sign in with
+        # Google" - console/ui.py's /login/demo path. See
+        # auth/provisioning.py: this flag is checked ONLY on that
+        # explicit entry point, never on an ordinary login, so it cannot
+        # be stumbled into by accident.
+        org = Organization(
+            org_id=org_id, display_name="MortemTrace Live Demo",
+            created_by="user_seed_bootstrap", public_demo_auto_join=True,
+        )
+        scope_store.bootstrap_organization_write(org_id, org.model_dump(mode="json"))
 
     for service in _services(org_id):
         scope_store.bootstrap_write(Collection.SERVICES, service.service_id, service.model_dump(mode="json"), org_id=org_id)
@@ -278,10 +292,17 @@ def main() -> None:
     import os
 
     org_id = os.environ.get("MORTEMTRACE_DEMO_ORG", DEMO_ORG_ID_DEFAULT)
-    summary = generate(org_id)
+    public_demo = os.environ.get("MORTEMTRACE_SEED_PUBLIC_DEMO") == "1"
+    summary = generate(org_id, public_demo=public_demo)
     print(f"seeded demo org: {org_id}")
     for key, count in summary.items():
         print(f"  {key}: {count}")
+    if public_demo:
+        print(
+            f"\n{org_id} is flagged public_demo_auto_join=True - anyone who signs in "
+            "via /login/demo joins it automatically, as role=member. Never set "
+            "MORTEMTRACE_SEED_PUBLIC_DEMO=1 against an org holding real tenant data."
+        )
     print(
         "\nincidents: inc_seed_checkout_outage (sev1, data_touched=True, "
         "services_affected=[checkout-api] -> orders-db -> rds, matches "

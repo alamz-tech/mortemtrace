@@ -74,7 +74,27 @@ for topic in evidence.received evidence.staged timeline.committed incident.class
   create_push_subscription "${topic}"
 done
 
+# A pull subscription on the dead-letter topic, so failed messages have a
+# path back into the pipeline. The dead-letter *destination* existed
+# already, but nothing consumed it: messages accumulated with no recovery
+# route and replaying meant hand-writing a script. See
+# infra/replay_dead_letter.py.
+echo "Creating the dead-letter replay subscription..."
+gcloud pubsub subscriptions create dead-letter-replay \
+  --project "${PROJECT}" \
+  --topic="dead-letter" \
+  --ack-deadline=60 \
+  2>&1 | grep -v "already exists" || true
+
 echo
-echo "Done. mortemtrace-ingest-api must be deployed WITHOUT MORTEMTRACE_SYNC_DISPATCH=1"
-echo "and WITH MORTEMTRACE_PUSH_AUDIENCE=${INGEST_URL} for these to actually be used"
-echo "(infra/deploy.sh sets both correctly)."
+echo "Done. mortemtrace-ingest-api must be deployed WITHOUT MORTEMTRACE_SYNC_DISPATCH=1,"
+echo "WITH MORTEMTRACE_PUSH_AUDIENCE=${INGEST_URL}, and WITH"
+echo "MORTEMTRACE_PUSH_SERVICE_ACCOUNT=${PUSHER_EMAIL} for these to be used and verified"
+echo "(infra/deploy.sh sets all three correctly)."
+echo
+echo "The push route verifies the issuing service account, not just the token audience -"
+echo "without MORTEMTRACE_PUSH_SERVICE_ACCOUNT set, any Google principal could mint an"
+echo "ID token for this URL and inject events."
+echo
+echo "Inspect dead-lettered messages at any time:"
+echo "  python infra/replay_dead_letter.py --dry-run"

@@ -1,0 +1,16 @@
+{
+  "name": "Datadog Monitors",
+  "source": "datadog",
+  "kind": "alert",
+  "is_change_source": false,
+  "verification": {
+    "strategy": "bearer",
+    "header": "DD-Webhook-Token"
+  },
+  "_setup": [
+    "Datadog -> Integrations -> Webhooks -> New",
+    "URL: <ingest-url>/webhook/<connector_id>",
+    "Add a custom header DD-Webhook-Token with the value you registered as secret_ref",
+    "Datadog does not sign webhook bodies, so a shared token is the available mechanism"
+  ]
+}

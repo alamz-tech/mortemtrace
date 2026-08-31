@@ -116,8 +116,29 @@ flowchart LR
 
 ## 3. Trust boundary and identity
 
+There are **two** boundaries here, and conflating them was this system's
+most serious defect for a period:
+
+| Layer | Question it answers | Where |
+|---|---|---|
+| **Authentication** | Is this caller entitled to act as tenant X? | `auth/identity.py` |
+| **Authorization** | May agent A read collection C for tenant X? | `data/scope_store.py` |
+
+The authorization layer was always correct. The authentication layer did
+not exist: `org_id` arrived as an HTTP form field or query parameter and
+was signed as-is, so the scope store faithfully enforced the scopes of an
+identity the caller had simply asserted. Both services were deployed
+`--allow-unauthenticated`, which made every tenant's incidents, drafts,
+GDPR clocks and audit log readable by anyone holding the URL.
+
+Signing a value gives it integrity. It never established provenance.
+Tenant identity now comes from the credential and can only *select*
+among tenants that credential already grants.
+
 ```mermaid
 sequenceDiagram
+    participant U as Caller
+    participant A as auth/identity
     participant E as Event
     participant C as Coordinator
     participant R as Registry
@@ -127,6 +148,10 @@ sequenceDiagram
     participant S as Scope Store
     participant F as Firestore
 
+    U->>A: request + Bearer token (or session cookie)
+    A->>A: sha256 lookup; resolve tenant FROM the credential
+    A-->>U: 401 no credential / 403 not your tenant / 429 rate limited
+    A->>E: authenticated request, tenant established
     E->>C: envelope { run_id, org_id, incident_id, signed claim }
     C->>C: verify signature, check turn + token budget
     C->>R: resolve agent version + declared scopes
@@ -151,6 +176,109 @@ sequenceDiagram
 3. Every timeline entry and hypothesis carries `source_event_ids[]`. Commits without one are rejected at the store layer, not the agent layer.
 4. Service account per agent role. Only Ledger writes `timeline`. Watcher writes only `signals` and can never read incident content.
 5. Read denials are logged and non-fatal. The run continues at reduced context rather than failing, because a Support draft without logs is the correct outcome, not an error.
+6. `org_id` is never read from request input. It is resolved from the authenticated
+   principal, and a credential can only select among tenants it already grants.
+   Regression-tested in `tests/test_auth.py` and at the HTTP layer in
+   `tests/test_console.py` / `tests/test_ingest.py`.
+7. Read-modify-write on a shared document goes through
+   `scope_store.update_in_transaction()`, never a read/write pair. Ledger appending to one
+   timeline under concurrent Pub/Sub delivery silently lost entries otherwise —
+   demonstrated at 7 of 20 lost in `tests/test_concurrency.py`.
+8. Both services are **closed by default**: no tokens configured and demo mode off means
+   every route 401s. There is no fallback to a default tenant.
+9. A human session cookie carries a user_id and nothing else — never an org_id or role.
+   Which organizations a session may act as, and with what role, is resolved from live
+   `Membership` rows on every request, so revoking access takes effect on the next request,
+   not after a cookie's expiry.
+
+## 3a. Human identity: organizations, membership, and SSO
+
+Section 3's table answers "is this caller entitled to act as tenant X" for *any* caller.
+For a human in a browser specifically, "entitled" is now a real, provisioned fact rather
+than a shared credential — this section is what sits between "who is this person" and the
+`OrgClaim` system above, which still has no concept of an individual person at all.
+
+| Layer | Question it answers | Where |
+|---|---|---|
+| Authentication | Who is this person? | `auth/oidc.py` (OIDC signature/issuer/audience/nonce verification) |
+| Session | Prove it again without re-running OIDC on every request | `auth/session.py` (MortemTrace's own signed cookie, user_id only) |
+| Org membership | Which organization(s) does this person belong to? | `Membership` documents, resolved fresh per request |
+| Authorization | What may they do in that organization? | `role_by_org` on the resolved `Principal` (`admin` / `member`) |
+| Tenant isolation | Can they ever reach another org's data? | Unchanged — the same `OrgClaim`/scope system in section 3, once the console has resolved which org_id this request may use |
+
+```mermaid
+sequenceDiagram
+    participant U as Human (browser)
+    participant O as auth/oidc.py
+    participant P as auth/provisioning.py
+    participant S as auth/session.py
+    participant C as Console route
+    participant D as scope_store (orgs/users/memberships)
+
+    U->>O: GET /login -> "Continue with Google" or a work email
+    O->>O: discovery + PKCE + state/nonce; redirect to the IdP
+    U->>O: GET /auth/callback?code=...&state=...
+    O->>O: verify signature (JWKS), iss, aud, nonce, exp
+    O->>P: VerifiedIdentity(issuer, sub, email)
+    P->>D: upsert_user; apply invite/demo/domain auto-join if any
+    D-->>P: current Membership rows for this user
+    P->>S: mint_session(user_id) — NEVER org_id or role
+    S-->>U: HttpOnly, SameSite=Strict session cookie
+    U->>C: GET / (cookie attached)
+    C->>D: list_memberships_for_user(user_id) — fresh, not cached
+    D-->>C: {org_id: role, ...}
+    C->>C: mint an ordinary OrgClaim for the resolved org_id
+    Note over C: from here on, this is exactly section 3's diagram
+```
+
+**Rules the code enforces, not merely documents**
+
+1. Google Sign-In and an organization's own IdP (Entra ID, Okta, Auth0, ...) are the same
+   code path (`auth/oidc.py`), not two implementations — only the issuer/client
+   configuration differs. SAML is out of scope: every named IdP already speaks OIDC.
+2. An org is created by an already-authenticated identity with zero existing memberships;
+   its creator becomes that org's first admin in the same Firestore transaction as the org
+   document itself, so an org can never exist with nobody able to administer it.
+3. Redeeming an invitation requires authenticating as the *exact* email it was issued to —
+   possessing the link is not proof of identity.
+4. `public_demo_auto_join` is checked only on the explicit `/login/demo` entry point, never
+   on an ordinary login — an employee who mistakenly signs in with a personal account is
+   sent to organization creation, not silently placed inside the demo tenant.
+5. Every admin-gated action (`invite`, `revoke`, configure SSO) re-checks a live Membership
+   row inside `data/scope_store.py` itself, never trusting the caller's session claims alone
+   — the same "the data layer decides" discipline section 3 already applies to agent scopes.
+6. Machine-to-machine ingestion authentication (API tokens, connector webhook signatures)
+   and human browser authentication are separate credential types end to end — an API
+   token can never reach an admin-gated console action (it has no role), and a webhook can
+   never authenticate as a human at all.
+
+## 3b. Inbound connectors: one receiver, any tool
+
+Integrations are **configuration, not code**. `POST /webhook/{connector_id}` accepts
+arbitrary JSON from any source; the body is stored as evidence and Intake — which already
+extracts structure from unstructured input — normalises it.
+
+That is only viable *because* an extraction agent already exists. A platform doing
+deterministic field parsing genuinely would need a parser per vendor; this one does not,
+and building adapters per tool would have made every customer's existing tooling a support
+request.
+
+| Concern | Approach |
+|---|---|
+| Payload shape | None assumed. Verified against GitHub, GitLab, Jenkins, ArgoCD, Terraform, Datadog, PagerDuty, Grafana, Sentry and Alertmanager shapes through one code path. |
+| Semantic fields | Best-effort generic extraction (`repository.name`, `job_name`, `project.name`, `app.name`, `workspace.name` all resolve). Unmatched fields stay `None` rather than being guessed; `raw` is always retained. |
+| Verification | The one irreducibly per-vendor part — no signing standard exists. Collapsed to four configurable strategies (`hmac`, `bearer`, `ip_allowlist`, `none`) rather than N adapters. |
+| Secrets | In `MORTEMTRACE_CONNECTOR_SECRETS`, never in the connector document — which is readable with `connectors` read scope, so a key stored there would make read access equivalent to forging events. |
+| Presets | JSON files in `connectors/presets/`. Supporting a new tool is a data change. |
+| Pull-based tools | Deliberately absent. Kubernetes/CRM *push* using the customer's own credentials inside their own network, so no credential reaching into a customer estate is ever stored here. |
+
+**Change correlation.** Connectors marked `--change-source` write to `change_events`
+instead of opening an incident — a deploy is not an outage. Diagnosis reads the 2 hours
+before an incident opened and is told explicitly that temporal proximity is evidence, not
+proof. Verified live: a GitHub deploy webhook followed by an unrelated incident submission
+produced the hypothesis *"the deployment of payments-api (ref 7c4e91ab2f) is the likely
+root cause ... given its close temporal proximity"* — naming the specific commit while
+correctly hedging causation.
 
 ## 4. The Watcher, correlated not broadcast
 

@@ -5,7 +5,7 @@ documented. If one of these goes red, the architecture's core claim -
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -109,7 +109,7 @@ def test_tenant_violation_is_not_a_scope_denied(fake_db):
 def test_expired_claim_denied(fake_db):
     seed_agent(fake_db, "postmortem", "1.0.0", read_scopes=[Collection.TIMELINE], write_scopes=[])
     claim = _claim("postmortem")
-    claim.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    claim.expires_at = datetime.now(UTC) - timedelta(minutes=1)
 
     with pytest.raises(scope_store.TenantViolation):
         scope_store.read(claim, Collection.TIMELINE, "inc_1")

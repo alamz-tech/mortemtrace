@@ -1,0 +1,18 @@
+{
+  "name": "Jenkins",
+  "source": "jenkins",
+  "kind": "alert",
+  "is_change_source": true,
+  "verification": {
+    "strategy": "bearer",
+    "header": "Authorization"
+  },
+  "_setup": [
+    "Install the Generic Webhook / Notification plugin, or add a post-build curl:",
+    "  curl -X POST <ingest-url>/webhook/<connector_id> \\",
+    "    -H \"Authorization: Bearer $MORTEMTRACE_TOKEN\" \\",
+    "    -H 'Content-Type: application/json' \\",
+    "    -d \"{\\\"service\\\":\\\"$JOB_NAME\\\",\\\"build_number\\\":\\\"$BUILD_NUMBER\\\",\\\"actor\\\":\\\"$BUILD_USER\\\"}\"",
+    "No plugin is required - any tool that can run curl can be a change source"
+  ]
+}

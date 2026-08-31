@@ -18,7 +18,12 @@ import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-EXEMPT_DIRS = {"infra", "seed", "tests", ".venv"}
+# build/ and dist/ hold *copies* of source produced by `python -m build`.
+# The exemption for the real file is by exact path, so a build-artifact
+# copy of scope_store.py would otherwise be reported as a violation -
+# failing the suite for anyone who has built a wheel, which is a false
+# positive rather than a finding.
+EXEMPT_DIRS = {"infra", "seed", "tests", ".venv", "build", "dist", ".git"}
 EXEMPT_FILES = {REPO_ROOT / "data" / "scope_store.py"}
 
 _FORBIDDEN_PATTERNS = [

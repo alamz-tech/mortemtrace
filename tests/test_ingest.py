@@ -20,8 +20,9 @@ from fastapi.testclient import TestClient
 
 import api.ingest as ingest_module
 from agents.contracts import NextEvent, RunResult
+from auth import identity
 from data.models import Collection
-from tests.conftest import TEST_ORG, seed_agent
+from tests.conftest import OTHER_ORG, TEST_ORG, auth_header, seed_agent
 
 
 @pytest.fixture
@@ -30,7 +31,7 @@ def client(fake_db):
         fake_db, ingest_module.INGEST_AGENT_NAME, ingest_module.INGEST_AGENT_VERSION,
         read_scopes=[], write_scopes=[Collection.INCIDENTS, Collection.RAW_EVIDENCE],
     )
-    return TestClient(ingest_module.app)
+    return TestClient(ingest_module.app, headers=auth_header())
 
 
 @pytest.fixture
@@ -47,8 +48,8 @@ def _raw_evidence_docs(fake_db) -> list[dict]:
     ]
 
 
-def test_healthz():
-    resp = TestClient(ingest_module.app).get("/healthz")
+def test_status():
+    resp = TestClient(ingest_module.app).get("/status")
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
 
@@ -132,10 +133,13 @@ def test_ingest_rejects_invalid_kind_with_422(client, published):
     assert resp.status_code == 422
 
 
-def test_ingest_rejects_missing_org_id_with_422(client, published):
+def test_ingest_without_org_id_uses_the_tenant_the_token_grants(client, published, fake_db):
+    """org_id is now optional: a single-tenant credential determines it.
+    It is no longer a required *input* because it was never safe as one."""
     resp = client.post("/ingest", data={"kind": "log", "payload": "x"})
 
-    assert resp.status_code == 422
+    assert resp.status_code == 200
+    assert _raw_evidence_docs(fake_db)[0]["org_id"] == TEST_ORG
 
 
 def test_sync_dispatch_flag_calls_coordinator_route_in_process(client, monkeypatch):
@@ -214,15 +218,23 @@ def _push_body(payload: dict) -> dict:
     return {"message": {"data": data, "messageId": "1"}, "subscription": "projects/p/subscriptions/s"}
 
 
-def test_pubsub_push_rejects_missing_auth_header(client):
-    resp = client.post("/pubsub/push/evidence.staged", json=_push_body({"run_id": "r", "org_id": TEST_ORG}))
+@pytest.fixture
+def push_config(monkeypatch):
+    monkeypatch.setenv(identity._PUSH_AUDIENCE_ENV, "https://example.run.app")
+    monkeypatch.setenv(identity._PUSH_SA_ENV, "pusher@example.iam.gserviceaccount.com")
+
+
+def test_pubsub_push_rejects_missing_auth_header(client, push_config):
+    resp = client.post(
+        "/pubsub/push/evidence.staged",
+        json=_push_body({"run_id": "r", "org_id": TEST_ORG}),
+        headers={"Authorization": ""},
+    )
 
     assert resp.status_code == 401
 
 
-def test_pubsub_push_rejects_invalid_token(client, monkeypatch):
-    monkeypatch.setenv(ingest_module._PUSH_AUDIENCE_ENV, "https://example.run.app")
-
+def test_pubsub_push_rejects_invalid_token(client, push_config):
     resp = client.post(
         "/pubsub/push/evidence.staged",
         json=_push_body({"run_id": "r", "org_id": TEST_ORG}),
@@ -294,8 +306,8 @@ def test_watcher_sweep_endpoint_correlates_real_seed_data(fake_db, clean_coordin
     hop after a match) is stubbed, since this test is about proving the
     sweep endpoint reaches Watcher and Watcher's real match fires, not
     about Diagnosis's own behavior."""
-    from agents.watcher.watcher import run as watcher_run
     from agents.contracts import RunResult
+    from agents.watcher.watcher import run as watcher_run
     from seed.generate import generate
 
     generate(TEST_ORG)
@@ -311,9 +323,112 @@ def test_watcher_sweep_endpoint_correlates_real_seed_data(fake_db, clean_coordin
     clean_coordinator.register_worker("diagnosis", lambda claim, envelope: RunResult(status="ok"))
     monkeypatch.setenv("MORTEMTRACE_DEMO_ORG", TEST_ORG)
 
-    resp = TestClient(ingest_module.app).post("/watcher/sweep", json={})
+    resp = TestClient(ingest_module.app, headers=auth_header()).post("/watcher/sweep", json={})
 
     assert resp.status_code == 200
     body = resp.json()
     assert "3 signal(s) polled" in body["detail"]
     assert "1 incident(s) correlated" in body["detail"]
+
+
+# --------------------------------------------------------------------------
+# Security regressions (see tests/test_auth.py for the unit-level cases)
+# --------------------------------------------------------------------------
+
+def test_ingest_without_credential_is_rejected(fake_db):
+    """The deployed service accepted this with no credential at all and
+    signed a claim for whatever org_id the body named."""
+    resp = TestClient(ingest_module.app).post(
+        "/ingest", data={"org_id": TEST_ORG, "kind": "log", "payload": "x"},
+    )
+    assert resp.status_code == 401
+
+
+def test_ingest_cannot_write_into_another_tenant(client, published, fake_db):
+    """Cross-tenant write: a credential for TEST_ORG naming OTHER_ORG."""
+    resp = client.post(
+        "/ingest", data={"org_id": OTHER_ORG, "kind": "log", "payload": "x"},
+    )
+
+    assert resp.status_code == 403
+    assert not [p for p in fake_db._docs if p[:2] == ("tenants", OTHER_ORG)]
+
+
+def test_ingest_rejects_org_id_with_firestore_path_separator(client, published):
+    resp = client.post(
+        "/ingest", data={"org_id": "org_test/evil", "kind": "log", "payload": "x"},
+    )
+    assert resp.status_code in (400, 403)
+
+
+def test_ingest_rejects_incident_id_with_path_separator(client, published):
+    resp = client.post("/ingest", data={
+        "kind": "log", "payload": "x", "incident_id": "inc_a/../../other",
+    })
+    assert resp.status_code == 400
+
+
+def test_ingest_rate_limits_repeated_calls(client, published, monkeypatch):
+    """Ingest fans out into paid model calls, so an unbounded caller is a
+    cost-exhaustion vector. Verified against the real limiter."""
+    monkeypatch.setattr(ingest_module, "_INGEST_LIMITER",
+                        identity.TokenBucketLimiter(capacity=2, refill_per_second=0.0))
+
+    codes = [
+        client.post("/ingest", data={"kind": "log", "payload": "x"}).status_code
+        for _ in range(4)
+    ]
+
+    assert codes[:2] == [200, 200]
+    assert codes[2:] == [429, 429]
+
+
+def test_watcher_sweep_without_credential_is_rejected():
+    resp = TestClient(ingest_module.app).post("/watcher/sweep", json={})
+    assert resp.status_code == 401
+
+
+def test_watcher_sweep_cannot_target_another_tenant(client):
+    resp = client.post("/watcher/sweep", json={"org_id": OTHER_ORG})
+    assert resp.status_code == 403
+
+
+# --------------------------------------------------------------------------
+# Payload size limits (Firestore's 1 MiB document ceiling)
+# --------------------------------------------------------------------------
+
+def test_oversized_screenshot_is_rejected_not_truncated(client, published):
+    """Previously truncated at 5 MB, which base64-expands to ~7 MB and is
+    ~6.7x over Firestore's 1 MiB document limit - so every upload above
+    ~768 KB produced an opaque 500 from the write instead of a clear 4xx."""
+    oversized = b"\x89PNG" + b"\x00" * (ingest_module._MAX_INLINE_FILE_BYTES + 1)
+
+    resp = client.post(
+        "/ingest",
+        data={"kind": "screenshot"},
+        files={"file": ("big.png", io.BytesIO(oversized), "image/png")},
+    )
+
+    assert resp.status_code == 413
+    assert "Firestore" in resp.json()["detail"]
+
+
+def test_largest_allowed_screenshot_still_fits_a_firestore_document(client, published, fake_db):
+    at_limit = b"\x89PNG" + b"\x00" * (ingest_module._MAX_INLINE_FILE_BYTES - 4)
+
+    resp = client.post(
+        "/ingest",
+        data={"kind": "screenshot"},
+        files={"file": ("big.png", io.BytesIO(at_limit), "image/png")},
+    )
+
+    assert resp.status_code == 200
+    stored = _raw_evidence_docs(fake_db)[0]["payload"]
+    assert len(stored.encode("utf-8")) < ingest_module._FIRESTORE_MAX_DOC_BYTES
+
+
+def test_oversized_text_payload_is_rejected(client, published):
+    resp = client.post("/ingest", data={
+        "kind": "log", "payload": "x" * (ingest_module._MAX_TEXT_PAYLOAD_BYTES + 1),
+    })
+    assert resp.status_code == 413

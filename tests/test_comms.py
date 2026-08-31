@@ -12,10 +12,20 @@ import json
 
 import pytest
 
+from agents.departments.comms import comms
 from data import scope_store
 from data.models import Collection, Envelope, OrgClaim
-from agents.departments.comms import comms
 from tests.conftest import TEST_ORG, seed_agent, stub_gateway
+
+
+@pytest.fixture(autouse=True)
+def _enable_demo_scope_proofs(monkeypatch):
+    """These cases assert the deliberate denied-read that produces the
+    on-camera audit proof. It is off by default in production (it costs a
+    registry lookup plus an audit write per run), so the tests that assert
+    it must turn it on explicitly."""
+    monkeypatch.setenv("MORTEMTRACE_DEMO_SCOPE_PROOFS", "1")
+
 
 INCIDENT_ID = "inc_1"
 

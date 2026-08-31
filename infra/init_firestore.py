@@ -49,15 +49,21 @@ _PLATFORM_ADMIN = dict(
 #     exactly: registry.resolve() needs REGISTRY read, _is_quarantined()
 #     needs QUARANTINE read, _touch_run() needs RUNS read+write,
 #     _quarantine() needs QUARANTINE write.
-#   - guardian's scopes match agents/guardian/guardian.py exactly: no
-#     scope_store reads at all (Model Armor screening doesn't go through
-#     it), only a write to Collection.ALERTS via _escalate().
-# intake/ledger/diagnosis/classifier/watcher/postmortem/comms/compliance/
-# exposure/ingest-api/console have no landed implementation to check
-# against yet (other sessions are building them in parallel) - their
-# entries below follow the build brief's table verbatim. If a landed
-# agents/*/*.py later declares a different scope than what's registered
-# here, the code wins; re-run this script after updating the table.
+#   - guardian's scopes match agents/guardian/guardian.py exactly:
+#     RAW_EVIDENCE read (preflight screens the evidence body) plus a
+#     write to Collection.ALERTS via _escalate().
+# Every agent below now has a landed implementation, and the scopes here
+# have been reconciled against what that code actually reads and writes.
+# If they ever disagree, the code is the source of truth: an agent
+# denied a scope it needs degrades (or dead-letters) rather than
+# escalating, so an over-narrow entry is a visible bug and an over-broad
+# one is a silent security hole. Re-run this script after changing any
+# agent's data access.
+#
+# NOTE: re-running is REQUIRED after upgrading a deployment that predates
+# guardian gaining RAW_EVIDENCE read scope - without it, guardian.preflight
+# cannot read the evidence it is supposed to screen and degrades to
+# screening nothing (which is exactly the no-op bug that scope fixed).
 _FLEET: list[dict] = [
     dict(
         agent_name="coordinator", version="1.0.0",
@@ -69,7 +75,12 @@ _FLEET: list[dict] = [
     dict(
         agent_name="guardian", version="1.0.0",
         input_schema="Envelope", output_schema="AlertRecord",
-        read_scopes=[],
+        # RAW_EVIDENCE is required for preflight to screen the evidence
+        # body rather than only envelope metadata (see guardian.preflight).
+        # Guardian is a governance agent, not a departmental one: it reads
+        # evidence solely to screen it and never writes anything derived
+        # from the content - only an alert saying it was blocked.
+        read_scopes=[Collection.RAW_EVIDENCE],
         write_scopes=[Collection.ALERTS],
         department=None,
     ),
@@ -90,15 +101,29 @@ _FLEET: list[dict] = [
     dict(
         agent_name="diagnosis", version="1.0.0",
         input_schema="Timeline", output_schema="Hypothesis",
-        read_scopes=[Collection.TIMELINE, Collection.RAW_EVIDENCE, Collection.MEMORY],
+        # CHANGE_EVENTS: "what shipped just before this broke?" - the
+        # correlation signal inbound CI/CD connectors feed (see
+        # connectors/ and diagnosis._recent_changes).
+        read_scopes=[
+            Collection.TIMELINE, Collection.RAW_EVIDENCE, Collection.MEMORY,
+            Collection.CHANGE_EVENTS,
+        ],
         write_scopes=[Collection.HYPOTHESES],
         department=None,
     ),
     dict(
         agent_name="classifier", version="1.0.0",
         input_schema="Timeline", output_schema="Classification",
-        read_scopes=[Collection.TIMELINE, Collection.RAW_EVIDENCE],
-        write_scopes=[Collection.CLASSIFICATION],
+        # INCIDENTS read+write is for the severity/services_affected
+        # backfill in agents/classifier/classifier.py: Classification is
+        # where those values first become known, and the Incident record
+        # the dashboard lists is where they have to land to be visible.
+        # Read is required alongside write because the backfill is a
+        # transactional read-modify-write (it must not clobber `status`,
+        # owned by the incident lifecycle) - see scope_store.
+        # update_in_transaction, which authorizes both for exactly this reason.
+        read_scopes=[Collection.TIMELINE, Collection.RAW_EVIDENCE, Collection.INCIDENTS],
+        write_scopes=[Collection.CLASSIFICATION, Collection.INCIDENTS],
         department=None,
     ),
     dict(
@@ -138,9 +163,17 @@ _FLEET: list[dict] = [
     ),
     dict(
         agent_name="ingest-api", version="1.0.0",
-        input_schema="HTTP multipart (alert JSON | text | image)", output_schema="RawEvidence",
-        read_scopes=[],
-        write_scopes=[Collection.INCIDENTS, Collection.RAW_EVIDENCE],
+        input_schema="HTTP multipart (alert JSON | text | image) or arbitrary webhook JSON",
+        output_schema="RawEvidence | ChangeEvent",
+        # CONNECTORS read is for listing a tenant's connectors; the
+        # webhook receiver itself resolves one by id through the
+        # unauthenticated find_connector path (see scope_store's connector
+        # section for why that indirection is unavoidable).
+        read_scopes=[Collection.CONNECTORS],
+        write_scopes=[
+            Collection.INCIDENTS, Collection.RAW_EVIDENCE,
+            Collection.CHANGE_EVENTS, Collection.CONNECTORS,
+        ],
         department=None,
     ),
     dict(

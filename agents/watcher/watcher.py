@@ -40,6 +40,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+from agents.contracts import NextEvent, RunResult
 from data import scope_store
 from data.models import (
     Collection,
@@ -51,7 +52,6 @@ from data.models import (
     new_id,
     now,
 )
-from agents.contracts import NextEvent, RunResult
 
 logger = logging.getLogger("mortemtrace.watcher")
 

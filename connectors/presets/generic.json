@@ -1,0 +1,20 @@
+{
+  "name": "Generic webhook",
+  "source": "custom",
+  "kind": "alert",
+  "is_change_source": false,
+  "verification": {
+    "strategy": "hmac",
+    "header": "X-Signature",
+    "algorithm": "sha256",
+    "encoding": "hex"
+  },
+  "_setup": [
+    "Any tool that can POST JSON works with no adapter:",
+    "  curl -X POST <ingest-url>/webhook/<connector_id> \\",
+    "    -H 'Content-Type: application/json' -d '{...anything...}'",
+    "The payload shape does not matter - Intake extracts meaning from it.",
+    "For a tool that cannot sign, register with strategy 'none' and treat",
+    "the URL itself as the secret (same model as a Slack incoming webhook)."
+  ]
+}

@@ -20,6 +20,8 @@ actually cite anything."
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime, timedelta
+from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -50,7 +52,15 @@ _INSTRUCTION = (
     "listed in a memory signature shown to you. If nothing plausibly "
     "matches, leave prior_incident_refs empty.\n"
     "- confidence is a float between 0.0 and 1.0 reflecting how strongly "
-    "the cited entries support the statement."
+    "the cited entries support the statement.\n"
+    "- You may also be shown changes (deploys, merges, rollbacks, infra "
+    "applies) that happened shortly before the incident. Temporal "
+    "proximity is evidence, not proof: you may name a change as a likely "
+    "cause and should say so plainly when the timing is suggestive, but "
+    "do not state that a change caused the incident as established fact "
+    "unless a timeline entry actually supports it. Your "
+    "source_entry_indices must still cite timeline entries - a change "
+    "alone is not a citable source."
 )
 
 
@@ -75,13 +85,14 @@ def run(claim: OrgClaim, envelope: Envelope) -> RunResult:
     timeline = Timeline.model_validate(timeline_raw)
 
     memories = memory_bank.retrieve(claim, kind="incident_signature", limit=_MEMORY_LIMIT)
+    changes = _recent_changes(claim, timeline)
 
     agent, outcome = agent_gateway.build_agent(
         name=AGENT_NAME, run_id=claim.run_id, org_id=claim.org_id,
         instruction=_INSTRUCTION, output_schema=HypothesisDraft,
     )
     invoked = agent_gateway.invoke(
-        agent, _build_prompt(timeline, memories), run_id=claim.run_id, org_id=claim.org_id,
+        agent, _build_prompt(timeline, memories, changes), run_id=claim.run_id, org_id=claim.org_id,
     )
 
     if outcome.blocked:
@@ -127,7 +138,62 @@ def run(claim: OrgClaim, envelope: Envelope) -> RunResult:
     return RunResult(status="ok", tokens_used=invoked.tokens_used, turns=invoked.turns)
 
 
-def _build_prompt(timeline: Timeline, memories: list[MemoryRecord]) -> str:
+# How far back to look for a change that could plausibly have caused this
+# incident. Most change-induced outages surface within minutes of the
+# deploy; a wider window mostly adds unrelated deploys as noise, and a
+# model shown noise will happily correlate with it.
+_CHANGE_WINDOW = timedelta(hours=2)
+_CHANGE_LIMIT = 10
+
+
+def _recent_changes(claim: OrgClaim, timeline: Timeline) -> list[dict]:
+    """Deploys, merges and infra applies shortly before this incident.
+
+    "What shipped just before this broke?" is the highest-value question
+    in incident response and this system previously had nowhere to record
+    the answer. try_query so an org with no change connector configured
+    (the common case) degrades to an empty list rather than failing the
+    run - change correlation is an enrichment, never a prerequisite.
+    """
+    if not timeline.entries:
+        return []
+    incident_start = min(e.ts for e in timeline.entries)
+    window_start = (incident_start - _CHANGE_WINDOW).isoformat()
+
+    changes = scope_store.try_query(
+        claim, Collection.CHANGE_EVENTS,
+        filters=[("occurred_at", ">=", window_start)],
+        limit=_CHANGE_LIMIT, order_by="occurred_at", descending=True,
+    )
+    # Upper bound applied client-side: Firestore cannot combine two range
+    # filters on one field with a descending order without a composite
+    # index, and the list is already bounded to _CHANGE_LIMIT.
+    #
+    # Compared as parsed datetimes, not ISO strings. String ordering only
+    # happens to work while every writer emits the same offset format -
+    # "...Z" sorts before "...+00:00" for the same instant, so one
+    # producer writing Z would silently mis-order the window. The
+    # Firestore filter above is still a string comparison, but it is only
+    # a lower bound: it over-fetches at worst, and this is what decides.
+    def _before_incident(change: dict) -> bool:
+        raw = change.get("occurred_at")
+        if not raw:
+            return False
+        try:
+            occurred = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            logger.warning("change event %s has an unparseable occurred_at %r",
+                           change.get("change_id"), raw)
+            return False
+        if occurred.tzinfo is None:
+            occurred = occurred.replace(tzinfo=UTC)
+        return occurred <= incident_start
+
+    return [c for c in changes if _before_incident(c)]
+
+
+def _build_prompt(timeline: Timeline, memories: list[MemoryRecord],
+                  changes: Optional[list[dict]] = None) -> str:
     lines = [f"Incident {timeline.incident_id} - committed timeline ({len(timeline.entries)} entries):"]
     for i, entry in enumerate(timeline.entries):
         lines.append(f"[{i}] ts={entry.ts.isoformat()} action={entry.action!r} evidence={entry.evidence!r}")
@@ -141,6 +207,21 @@ def _build_prompt(timeline: Timeline, memories: list[MemoryRecord]) -> str:
             )
     else:
         lines.append("No prior incident signatures available in Memory Bank.")
+
+    lines.append("")
+    if changes:
+        lines.append(
+            "Changes deployed shortly BEFORE this incident began (correlation, not proof - "
+            "a deploy close in time is a candidate cause, not an established one):"
+        )
+        for change in changes:
+            lines.append(
+                f"- {change.get('occurred_at')} source={change.get('source')} "
+                f"kind={change.get('kind')} service={change.get('service')} "
+                f"ref={change.get('ref')} actor={change.get('actor')}: {change.get('summary')}"
+            )
+    else:
+        lines.append("No change events recorded before this incident.")
 
     lines.append("")
     lines.append("Respond with exactly one hypothesis per the rules in your instructions.")

@@ -50,17 +50,46 @@
   a.incident-link { color: var(--accent); }
   .deny-row { background: rgba(224,82,74,0.07); }
   .source-ids span { display: inline-block; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 0 0.35rem; margin: 0.1rem 0.25rem 0.1rem 0; font-size: 0.72rem; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .link-button { background: none; border: 0; padding: 0; margin: 0; color: var(--muted); font: inherit; cursor: pointer; text-decoration: none; }
+  .link-button:hover { color: var(--text); }
+  select.org-switch { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 0.2rem 0.4rem; font: inherit; }
 </style>
 {% block head %}{% endblock %}
 </head>
 <body>
 <header>
+  {% if org_id %}
   <a class="brand" href="/?org_id={{ org_id }}">MortemTrace</a>
   <nav>
     <a href="/?org_id={{ org_id }}">Dashboard</a>
     <a href="/audit?org_id={{ org_id }}">Audit log</a>
+    {% if current_role == "admin" %}
+    <a href="/orgs/{{ org_id }}/members">Members</a>
+    <a href="/orgs/{{ org_id }}/sso">SSO settings</a>
+    {% endif %}
   </nav>
-  <span class="muted mono" style="margin-left:auto;">org: {{ org_id }}</span>
+  {% else %}
+  <a class="brand" href="/">MortemTrace</a>
+  {% endif %}
+  <span style="margin-left:auto; display:flex; align-items:center; gap:0.9rem;">
+    {% if org_id and other_org_ids %}
+    <form method="get" action="/" style="display:inline;">
+      <select name="org_id" class="org-switch" onchange="this.form.submit()">
+        <option value="{{ org_id }}" selected>{{ org_id }}</option>
+        {% for other in other_org_ids %}
+        <option value="{{ other }}">{{ other }}</option>
+        {% endfor %}
+      </select>
+    </form>
+    {% elif org_id %}
+    <span class="muted mono">org: {{ org_id }}</span>
+    {% endif %}
+    {% if is_human %}
+    <form method="post" action="/logout" style="display:inline;">
+      <button type="submit" class="link-button">Sign out</button>
+    </form>
+    {% endif %}
+  </span>
 </header>
 <main>
 {% block content %}{% endblock %}

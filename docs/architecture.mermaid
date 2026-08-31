@@ -2,8 +2,15 @@ flowchart TB
     subgraph IN_["Inbound"]
         AL["Alert payloads<br/>PagerDuty / Datadog schema"]
         EV["Pasted logs, Slack thread,<br/>dashboard screenshots"]
+        WH["Webhooks<br/>any tool, HMAC/bearer/IP-verified"]
         EXT["External feeds<br/>provider status, changelogs, CVE"]
         SCH["Cloud Scheduler<br/>watcher + stale sweeps"]
+    end
+
+    subgraph ID["Identity - human callers"]
+        OIDC["Google Sign-In /<br/>org's own SSO (OIDC)"]
+        SESS["Session cookie<br/>signed, HttpOnly"]
+        ORG["Organizations + Memberships<br/>role resolved server-side, never from the cookie"]
     end
 
     subgraph EDGE["Ingest"]
@@ -59,7 +66,11 @@ flowchart TB
 
     AL --> API
     EV --> API
+    WH -->|verified per-connector| API
     API --> T1
+    OIDC --> SESS --> ORG
+    ORG -->|resolves tenant server-side| UI
+    ORG -->|API tokens, machine callers only| API
     EXT --> WT
     SCH --> WT
     T1 --> CO

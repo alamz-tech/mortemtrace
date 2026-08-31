@@ -77,9 +77,27 @@
   }
 
   function poll() {
-    fetch("/api/runs?org_id=" + encodeURIComponent(orgId))
-      .then(function (r) { return r.json(); })
-      .then(render)
+    // Same-origin fetch, so the HttpOnly session cookie is sent automatically.
+    // Accept is explicit, not left to the browser default: the server
+    // redirects unauthenticated *navigations* to /login but must keep
+    // returning a real 401 here, or this handler would parse the login
+    // page's HTML as if it were run data.
+    fetch("/api/runs?org_id=" + encodeURIComponent(orgId), {
+      headers: { "Accept": "application/json" },
+    })
+      .then(function (r) {
+        if (r.status === 401) {
+          // Session expired mid-session. Without this the page would poll
+          // a 401 forever behind a frozen table that still looks live -
+          // stale data presented as current is worse than an obvious
+          // logout, particularly on an incident dashboard.
+          window.location = "/login";
+          return null;
+        }
+        if (!r.ok) { return null; }
+        return r.json();
+      })
+      .then(function (runs) { if (runs) { render(runs); } })
       .catch(function () { /* transient poll failure - keep last good state on screen */ });
   }
 

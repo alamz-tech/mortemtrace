@@ -9,5 +9,11 @@
       ]
     }
   ],
-  "fieldOverrides": []
+  "fieldOverrides": [
+    {
+      "collectionGroup": "audit",
+      "fieldPath": "expires_at",
+      "ttlConfig": {}
+    }
+  ]
 }

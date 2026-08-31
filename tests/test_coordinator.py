@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from data import scope_store
-from data.models import AgentVersionRecord, Collection, Envelope
 from agents.contracts import NextEvent, RunResult
 from agents.coordinator import coordinator
+from data import scope_store
+from data.models import AgentVersionRecord, Collection, Envelope
 from registry import registry
 from tests.conftest import TEST_ORG, seed_agent
 

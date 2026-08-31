@@ -13,9 +13,9 @@ approach as tests/test_scope_store.py.
 """
 from __future__ import annotations
 
+from agents.watcher import watcher
 from data import scope_store
 from data.models import Collection, DowntimeWindow, Envelope, Signal, now
-from agents.watcher import watcher
 from tests.conftest import TEST_ORG, seed_agent
 
 

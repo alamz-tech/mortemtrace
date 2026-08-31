@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-import os
+import hashlib
+import json
+import sys
 
 import pytest
 
+from auth import identity
 from data import scope_store
 from data.models import Collection
 from gateway import agent_gateway
@@ -12,10 +15,55 @@ from tests.fakes import FakeFirestore
 TEST_ORG = "org_test"
 OTHER_ORG = "org_other"
 
+# Real tokens used by HTTP-level tests. These exercise the genuine
+# authentication path rather than monkeypatching it away, so a regression
+# that reopens the unauthenticated hole fails the suite.
+TEST_TOKEN = "test-token-for-org-test"
+OTHER_TOKEN = "test-token-for-org-other"
+MULTI_ORG_TOKEN = "test-token-for-both-orgs"
+
+
+def auth_header(token: str = TEST_TOKEN) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
 
 @pytest.fixture(autouse=True)
 def _claim_secret(monkeypatch):
     monkeypatch.setenv("MORTEMTRACE_CLAIM_SECRET", "test-secret-not-for-deploy")
+
+
+@pytest.fixture(autouse=True)
+def _session_secret(monkeypatch):
+    monkeypatch.setenv("MORTEMTRACE_SESSION_SECRET", "test-session-secret-not-for-deploy")
+
+
+@pytest.fixture(autouse=True)
+def _api_tokens(monkeypatch):
+    """Configures the token table for every test, and asserts the default
+    posture is closed by leaving anonymous demo mode off unless a test
+    turns it on explicitly."""
+    monkeypatch.setenv(identity._TOKENS_ENV, json.dumps({
+        _digest(TEST_TOKEN): {"org_ids": [TEST_ORG], "subject": "test-single-org"},
+        _digest(OTHER_TOKEN): {"org_ids": [OTHER_ORG], "subject": "test-other-org"},
+        _digest(MULTI_ORG_TOKEN): {"org_ids": [TEST_ORG, OTHER_ORG], "subject": "test-multi-org"},
+    }))
+    monkeypatch.delenv(identity._ANON_DEMO_ENV, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiters():
+    """Limiter state is per-process and would otherwise carry request
+    counts from one test into the next."""
+    yield
+    for module_name, attr in (("api.ingest", "_INGEST_LIMITER"), ("console.ui", "_CONSOLE_LIMITER")):
+        module = sys.modules.get(module_name)
+        limiter = getattr(module, attr, None) if module else None
+        if limiter is not None:
+            limiter.reset()
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -40,7 +88,14 @@ def _shutdown_telemetry():
 def fake_db():
     fake = FakeFirestore()
     scope_store.set_client(fake)
+    # The registry scope cache is process-global and keyed only by
+    # (agent_name, version), so without this a scope resolved against one
+    # test's fake store stays visible to the next test's - including the
+    # empty "unregistered agent" result, which then denies an agent the
+    # later test did seed.
+    scope_store.clear_scope_cache()
     yield fake
+    scope_store.clear_scope_cache()
     scope_store.set_client(None)  # force re-creation next test, avoid cross-test leakage
 
 
@@ -75,6 +130,27 @@ def seed_agent(fake_db: FakeFirestore, agent_name: str, version: str,
             "status": "published",
         },
     )
+
+
+def seed_membership(fake_db: FakeFirestore, user_id: str, org_id: str, role: str = "member",
+                     *, email: str = "person@example.com", status: str = "active") -> None:
+    """Seeds a human identity + org membership directly, mirroring
+    seed_agent's role for the agent-scope system: enough for a test to
+    exercise session-based authorization without a real OIDC round trip."""
+    fake_db.seed(f"users/{user_id}", {
+        "user_id": user_id, "email": email, "display_name": email,
+        "created_at": "2026-01-01T00:00:00+00:00", "last_login_at": "2026-01-01T00:00:00+00:00",
+    })
+    fake_db.seed(f"memberships/{user_id}__{org_id}", {
+        "membership_id": f"{user_id}__{org_id}", "user_id": user_id, "org_id": org_id,
+        "role": role, "status": status, "invited_by": None,
+        "created_at": "2026-01-01T00:00:00+00:00",
+    })
+
+
+def mint_test_session_cookie(user_id: str) -> str:
+    from auth import session as session_module
+    return session_module.mint_session(user_id)
 
 
 def stub_gateway(monkeypatch, *, text: str, blocked: bool = False,

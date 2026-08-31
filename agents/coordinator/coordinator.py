@@ -16,12 +16,13 @@ import random
 import time
 from typing import Callable, Optional
 
-from data import scope_store
-from data.models import Collection, Envelope, OrgClaim, Run, now
 from agents.contracts import RunResult
 from agents.guardian import guardian
+from data import scope_store
+from data.models import Collection, Envelope, OrgClaim, Run, now
 from gateway.agent_gateway import LoopDetected
 from registry import registry
+from telemetry import otel_setup
 
 logger = logging.getLogger("mortemtrace.coordinator")
 
@@ -121,11 +122,68 @@ def dispatch(agent_name: str, envelope: Envelope) -> RunResult:
     """One worker, one envelope: quarantine check, Guardian pre-flight,
     retry/backoff on transient failure, budget + loop enforcement,
     Guardian post-flight. This is the unit Coordinator's own tests
-    exercise directly - route() is a thin fan-out loop on top of it."""
+    exercise directly - route() is a thin fan-out loop on top of it.
+
+    Wrapped in an agent-invocation span. R10 requires one per agent call,
+    and there was none: this module imported no telemetry at all, so
+    telemetry.agent_invocation() existed but was never called from
+    anywhere, and a trace showed the ingest span jumping straight to a
+    model call with no record of which agent ran or what it returned.
+    """
     coordinator_claim = _coordinator_claim(envelope.org_id, envelope.run_id)
     guardian_claim = _guardian_claim(envelope.org_id, envelope.run_id)
 
     resolved = registry.resolve(coordinator_claim, agent_name)
+    version = resolved.version if resolved else "unresolved"
+
+    with otel_setup.agent_invocation(
+        agent_name, version, envelope.run_id, envelope.org_id, envelope.incident_id,
+    ) as span:
+        result = _dispatch_inner(
+            agent_name, resolved, envelope, coordinator_claim, guardian_claim,
+        )
+        span.set_attribute("mortemtrace.status", result.status)
+        span.set_attribute("mortemtrace.tokens.total", result.tokens_used)
+        span.set_attribute("mortemtrace.turns", result.turns)
+
+    _record_outcome(agent_name, version, envelope, result)
+    return result
+
+
+def _record_outcome(agent_name: str, version: str, envelope: Envelope, result: RunResult) -> None:
+    """One structured, alertable record per dispatch outcome.
+
+    Non-`ok` statuses become countable metrics rather than something an
+    operator only discovers by noticing missing drafts - there were no
+    metrics of any kind before this, so nothing could page on a rising
+    dead-letter rate."""
+    otel_setup.record_metric(
+        "agent_dispatch",
+        labels_status=result.status,
+        agent_name=agent_name,
+        run_id=envelope.run_id,
+        org_id=envelope.org_id,
+        status=result.status,
+    )
+    if result.status != "ok":
+        logger.warning(
+            "dispatch of %s@%s finished as %s: %s",
+            agent_name, version, result.status, result.detail,
+            extra={
+                "run_id": envelope.run_id, "org_id": envelope.org_id,
+                "incident_id": envelope.incident_id, "agent_name": agent_name,
+                "status": result.status,
+            },
+        )
+
+
+def _dispatch_inner(
+    agent_name: str,
+    resolved,
+    envelope: Envelope,
+    coordinator_claim: OrgClaim,
+    guardian_claim: OrgClaim,
+) -> RunResult:
     if resolved is None:
         result = RunResult(status="dead_letter", detail=f"no published version for {agent_name}")
         _touch_run(coordinator_claim, envelope, agent_name, result)
@@ -153,7 +211,9 @@ def dispatch(agent_name: str, envelope: Envelope) -> RunResult:
         org_id=envelope.org_id, agent_name=agent_name, agent_version=resolved.version, run_id=envelope.run_id,
     )
 
-    result = _attempt_with_retry(agent_name, resolved.version, run_fn, worker_claim, coordinator_claim, envelope)
+    result = _attempt_with_retry(
+        agent_name, resolved.version, run_fn, worker_claim, coordinator_claim, envelope, guardian_claim,
+    )
     _touch_run(coordinator_claim, envelope, agent_name, result)
     guardian.postflight(guardian_claim, envelope, agent_name=agent_name, status=result.status, detail=result.detail)
     return result
@@ -166,28 +226,40 @@ def _attempt_with_retry(
     worker_claim: OrgClaim,
     coordinator_claim: OrgClaim,
     envelope: Envelope,
+    guardian_claim: OrgClaim,
 ) -> RunResult:
     last_error: Optional[Exception] = None
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
             result = run_fn(worker_claim, envelope)
             if result.turns > _MAX_TURNS or result.tokens_used > _MAX_TOKENS:
-                _quarantine(coordinator_claim, agent_name, agent_version,
+                _quarantine(coordinator_claim, agent_name, agent_version, envelope, guardian_claim,
                             reason=f"budget exceeded: turns={result.turns} tokens={result.tokens_used}")
                 return RunResult(status="dead_letter", detail="turn/token budget exceeded; quarantined",
                                   turns=result.turns, tokens_used=result.tokens_used)
             return result
         except LoopDetected as exc:
-            _quarantine(coordinator_claim, agent_name, agent_version, reason=str(exc))
+            _quarantine(coordinator_claim, agent_name, agent_version, envelope, guardian_claim,
+                        reason=str(exc))
             return RunResult(status="dead_letter", detail=f"loop detected: {exc}")
         except scope_store.TenantViolation as exc:
             return RunResult(status="denied", detail=str(exc))
         except Exception as exc:  # transient failure path only
             last_error = exc
+            otel_setup.record_metric(
+                "agent_attempt_failed", agent_name=agent_name,
+                run_id=envelope.run_id, org_id=envelope.org_id,
+            )
             if attempt < _MAX_RETRIES:
-                backoff = _BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
-                logger.warning("attempt %d/%d for %s failed (%s), retrying in %.1fs",
-                               attempt, _MAX_RETRIES, agent_name, exc, backoff)
+                # Jitter only - decorrelates retries across instances so they do
+                # not all wake together. Not a security primitive.
+                backoff = _BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)) + random.uniform(0, 0.5)  # noqa: S311
+                logger.warning(
+                    "attempt %d/%d for %s failed (%s), retrying in %.1fs",
+                    attempt, _MAX_RETRIES, agent_name, exc, backoff,
+                    extra={"run_id": envelope.run_id, "org_id": envelope.org_id,
+                           "agent_name": agent_name},
+                )
                 time.sleep(backoff)
     return RunResult(status="dead_letter", detail=f"exhausted retries: {last_error}")
 
@@ -201,31 +273,61 @@ def _is_quarantined(coordinator_claim: OrgClaim, agent_name: str, version: str) 
     return bool(hits)
 
 
-def _quarantine(coordinator_claim: OrgClaim, agent_name: str, agent_version: str, *, reason: str) -> None:
+def _quarantine(coordinator_claim: OrgClaim, agent_name: str, agent_version: str,
+                envelope: Envelope, guardian_claim: OrgClaim, *, reason: str) -> None:
     doc_id = f"{agent_name}__{agent_version}"
     scope_store.write(coordinator_claim, Collection.QUARANTINE, doc_id, {
         "agent_name": agent_name, "version": agent_version,
         "reason": reason, "quarantined_at": now().isoformat(),
     })
-    logger.error("quarantined %s@%s: %s", agent_name, agent_version, reason)
+    # Guardian's docstring promises /alerts indexes every non-happy-path
+    # outcome, and quarantine is the most severe of them - but
+    # escalate_quarantine() had zero call sites, so quarantines were the
+    # one outcome missing from the index that claimed to be complete.
+    guardian.escalate_quarantine(guardian_claim, envelope, agent_name=agent_name, reason=reason)
+    otel_setup.record_metric(
+        "agent_quarantined", agent_name=agent_name,
+        run_id=envelope.run_id, org_id=envelope.org_id,
+    )
+    logger.error(
+        "quarantined %s@%s: %s", agent_name, agent_version, reason,
+        extra={"run_id": envelope.run_id, "org_id": envelope.org_id, "agent_name": agent_name},
+    )
 
 
 def _touch_run(claim: OrgClaim, envelope: Envelope, agent_name: str, result: RunResult) -> None:
-    existing = scope_store.try_read(claim, Collection.RUNS, envelope.run_id)
-    if existing is None:
-        existing = Run(run_id=envelope.run_id, org_id=envelope.org_id, status="running").model_dump(mode="json")
+    """Accumulates one dispatch's outcome into the shared run record.
 
-    invoked = set(existing.get("agents_invoked", []))
-    invoked.add(agent_name)
-    existing["agents_invoked"] = sorted(invoked)
-    existing["turns_used"] = existing.get("turns_used", 0) + result.turns
-    existing["tokens_used"] = existing.get("tokens_used", 0) + result.tokens_used
+    Transactional: a run_id spans an entire ingest-to-drafts chain, and
+    `timeline.committed` fans out to six workers that Pub/Sub delivers
+    concurrently. The previous read-then-write lost agents_invoked
+    entries and token counts the same way the timeline lost entries, just
+    less visibly - the run record simply under-reported what had run.
+    """
+    def _merge(existing: Optional[dict]) -> dict:
+        record = existing or Run(
+            run_id=envelope.run_id, org_id=envelope.org_id, status="running",
+        ).model_dump(mode="json")
 
-    current_status = existing.get("status", "running")
-    current_status = "ok" if current_status == "running" else current_status
-    if _STATUS_SEVERITY.get(result.status, 0) >= _STATUS_SEVERITY.get(current_status, 0):
-        existing["status"] = result.status if result.status != "ok" else "running"
-    else:
-        existing["status"] = current_status if current_status != "ok" else "running"
+        invoked = set(record.get("agents_invoked", []))
+        invoked.add(agent_name)
+        record["agents_invoked"] = sorted(invoked)
+        record["turns_used"] = record.get("turns_used", 0) + result.turns
+        record["tokens_used"] = record.get("tokens_used", 0) + result.tokens_used
+        record["updated_at"] = now().isoformat()
 
-    scope_store.write(claim, Collection.RUNS, envelope.run_id, existing)
+        current_status = record.get("status", "running")
+        current_status = "ok" if current_status == "running" else current_status
+        if _STATUS_SEVERITY.get(result.status, 0) >= _STATUS_SEVERITY.get(current_status, 0):
+            record["status"] = result.status if result.status != "ok" else "running"
+        else:
+            record["status"] = current_status if current_status != "ok" else "running"
+
+        # Validate before persisting. data/models.py claims every document
+        # is schema-checked at the boundary; for runs that was not true,
+        # which is how "dead_letter" (not a legal RunStatus at the time)
+        # ended up stored. Round-tripping through the model makes the
+        # claim hold and would have surfaced that drift immediately.
+        return Run.model_validate(record).model_dump(mode="json")
+
+    scope_store.update_in_transaction(claim, Collection.RUNS, envelope.run_id, _merge)

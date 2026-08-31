@@ -16,7 +16,11 @@ import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-EXEMPT_DIRS = {"gateway", "infra", "seed", "tests", ".venv"}
+# build/ and dist/ hold *copies* of source produced by `python -m build`.
+# Without exempting them, building a wheel makes this test report the
+# copies as violations - a false positive that fails the suite for anyone
+# who has run a build, rather than a real finding.
+EXEMPT_DIRS = {"gateway", "infra", "seed", "tests", ".venv", "build", "dist", ".git"}
 
 _FORBIDDEN_PATTERNS = [
     re.compile(r"^\s*import\s+vertexai\b"),

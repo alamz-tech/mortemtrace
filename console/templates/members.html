@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}Members — {{ org_id }} — MortemTrace{% endblock %}
+{% block content %}
+<h1>Members</h1>
+<p class="muted mono">{{ org_id }}</p>
+
+{% if last_invite_link %}
+<div class="card" style="border-color: var(--accent);">
+  <p><strong>Invite link created.</strong> Share it with the invited person — it is shown only once:</p>
+  <p class="mono" style="word-break: break-all; background: var(--bg); padding: 0.6rem; border-radius: 6px;">
+    {{ last_invite_link }}
+  </p>
+  <p class="muted" style="font-size: 0.82rem;">
+    This deployment has no email-sending integration, so nothing was sent automatically —
+    copy this link and share it yourself (Slack, email, etc.). It expires in 14 days.
+  </p>
+</div>
+{% endif %}
+
+<div class="card">
+  <h2>Invite someone</h2>
+  <form method="post" action="/orgs/{{ org_id }}/invite" style="display:flex; gap:0.6rem; align-items:flex-end; flex-wrap:wrap;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div>
+      <label for="invite_email" class="muted" style="display:block; font-size:0.78rem;">Email</label>
+      <input id="invite_email" name="email" type="email" required
+             style="padding:0.5rem 0.65rem; background:var(--bg); color:var(--text);
+                    border:1px solid var(--border); border-radius:6px;">
+    </div>
+    <div>
+      <label for="invite_role" class="muted" style="display:block; font-size:0.78rem;">Role</label>
+      <select id="invite_role" name="role"
+              style="padding:0.5rem 0.65rem; background:var(--bg); color:var(--text);
+                     border:1px solid var(--border); border-radius:6px;">
+        <option value="member" selected>Member</option>
+        <option value="admin">Admin</option>
+      </select>
+    </div>
+    <button type="submit"
+            style="padding:0.55rem 1rem; background:var(--accent); color:#04121f;
+                   border:0; border-radius:6px; font-weight:700; cursor:pointer;">
+      Create invite link
+    </button>
+  </form>
+</div>
+
+<div class="card">
+  <table>
+    <thead>
+      <tr><th>Email</th><th>Role</th><th>Status</th><th>Last login</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for m in members %}
+      <tr>
+        <td class="mono">{{ m._user.email or m.user_id }}</td>
+        <td>
+          {% if m.status == "active" and m.user_id != acting_user_id %}
+          <form method="post" action="/orgs/{{ org_id }}/members/{{ m.user_id }}/role" style="display:inline;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <select name="role" class="org-switch" onchange="this.form.submit()">
+              <option value="member" {% if m.role == "member" %}selected{% endif %}>Member</option>
+              <option value="admin" {% if m.role == "admin" %}selected{% endif %}>Admin</option>
+            </select>
+          </form>
+          {% else %}
+          {{ m.role }}
+          {% endif %}
+        </td>
+        <td><span class="badge tone-{{ m._tone }}">{{ m.status }}</span></td>
+        <td class="muted">{{ m._user.last_login_at or "never" }}</td>
+        <td>
+          {% if m.status == "active" and m.user_id != acting_user_id %}
+          <form method="post" action="/orgs/{{ org_id }}/members/{{ m.user_id }}/revoke">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="link-button" style="color: var(--bad);"
+                    onclick="return confirm('Revoke access for {{ m._user.email or m.user_id }}?')">
+              Revoke
+            </button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="empty">No members yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

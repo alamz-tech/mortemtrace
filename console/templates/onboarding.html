@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Create your organization — MortemTrace{% endblock %}
+{% block content %}
+<div class="card" style="max-width: 460px; margin: 3rem auto;">
+  <h1>Create your organization</h1>
+  <p class="muted">
+    You're signed in, but not a member of any organization yet. Create one to get started —
+    you'll be its first administrator. If your team already uses MortemTrace, ask an admin
+    there for an invite link instead.
+  </p>
+  <form method="post" action="/onboarding" style="margin-top: 1rem;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label for="display_name" class="muted" style="display:block; margin-bottom:0.35rem;">
+      Organization name
+    </label>
+    <input id="display_name" name="display_name" type="text" required autofocus
+           placeholder="Acme Inc."
+           style="width:100%; padding:0.55rem 0.7rem; background:var(--bg); color:var(--text);
+                  border:1px solid var(--border); border-radius:6px;">
+    <button type="submit"
+            style="margin-top:0.9rem; width:100%; padding:0.55rem; background:var(--accent);
+                   color:#04121f; border:0; border-radius:6px; font-weight:700; cursor:pointer;">
+      Create organization
+    </button>
+  </form>
+</div>
+{% endblock %}

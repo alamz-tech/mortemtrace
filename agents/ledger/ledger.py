@@ -47,20 +47,35 @@ def run(claim: OrgClaim, envelope: Envelope) -> RunResult:
     if not incident_ref:
         return RunResult(status="dead_letter", detail="staged event has no incident_ref")
 
-    existing = scope_store.try_read(claim, Collection.TIMELINE, incident_ref)
-    timeline = (
-        Timeline.model_validate(existing)
-        if existing is not None
-        else Timeline(incident_id=incident_ref, org_id=claim.org_id)
-    )
-
     entry = _entry_from_event(event)
-    if not _has_duplicate_source(timeline, entry):
-        timeline.entries.append(entry)
-        timeline.entries.sort(key=lambda e: e.ts)
 
-    timeline.last_updated = now()
-    scope_store.write(claim, Collection.TIMELINE, incident_ref, timeline.model_dump(mode="json"))
+    def _append(current: dict | None) -> dict:
+        """Runs inside a Firestore transaction, and may be retried on
+        contention - so it must stay a pure function of `current` with no
+        side effects of its own."""
+        timeline = (
+            Timeline.model_validate(current)
+            if current is not None
+            else Timeline(incident_id=incident_ref, org_id=claim.org_id)
+        )
+        if not _has_duplicate_source(timeline, entry):
+            timeline.entries.append(entry)
+            timeline.entries.sort(key=lambda e: e.ts)
+        timeline.last_updated = now()
+        return timeline.model_dump(mode="json")
+
+    # Transactional because this is a read-modify-write on one shared
+    # document under genuine concurrency: Pub/Sub delivers evidence for
+    # the same incident in parallel and Cloud Run runs many instances.
+    # The previous read-then-write pair silently lost entries - two
+    # deliveries would each read the same timeline, each append their own
+    # entry, and whichever wrote second discarded the other's work with
+    # no error and no log. That is data loss on the single artifact this
+    # product exists to produce.
+    committed = scope_store.update_in_transaction(
+        claim, Collection.TIMELINE, incident_ref, _append,
+    )
+    entry_count = len(committed.get("entries", []))
 
     # Re-read-and-flip rather than reusing the dict fetched above: this is
     # its own distinct store operation (status transition on the source
@@ -76,7 +91,7 @@ def run(claim: OrgClaim, envelope: Envelope) -> RunResult:
             run_id=claim.run_id,
             org_id=claim.org_id,
             incident_id=incident_ref,
-            entry_count=len(timeline.entries),
+            entry_count=entry_count,
         ).model_dump(mode="json"),
     )
     return RunResult(status="ok", next_events=[next_event])

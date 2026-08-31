@@ -1,0 +1,20 @@
+{
+  "name": "GitHub Actions",
+  "source": "github",
+  "kind": "alert",
+  "is_change_source": true,
+  "verification": {
+    "strategy": "hmac",
+    "header": "X-Hub-Signature-256",
+    "algorithm": "sha256",
+    "encoding": "hex",
+    "prefix": "sha256="
+  },
+  "_setup": [
+    "Repo -> Settings -> Webhooks -> Add webhook",
+    "Payload URL: <ingest-url>/webhook/<connector_id>",
+    "Content type: application/json",
+    "Secret: the value you registered as secret_ref",
+    "Events: 'Workflow runs' and 'Pushes' (deploy + merge correlation)"
+  ]
+}

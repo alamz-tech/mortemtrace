@@ -11,12 +11,23 @@ exist" after one trigger, with zero human input in between.
 """
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from agents import wiring
 from data.models import Collection
 from gateway import agent_gateway
-from tests.conftest import TEST_ORG, seed_agent
+from tests.conftest import TEST_ORG, auth_header, seed_agent
+
+
+@pytest.fixture(autouse=True)
+def _enable_demo_scope_proofs(monkeypatch):
+    """These cases assert the deliberate denied-read that produces the
+    on-camera audit proof. It is off by default in production (it costs a
+    registry lookup plus an audit write per run), so the tests that assert
+    it must turn it on explicitly."""
+    monkeypatch.setenv("MORTEMTRACE_DEMO_SCOPE_PROOFS", "1")
+
 
 _CANNED = {
     "intake": '{"action": "checkout-api pods restarting under memory pressure", "confidence": 0.91}',
@@ -80,7 +91,7 @@ def test_one_ingest_call_produces_timeline_classification_and_all_four_drafts(
     wiring.register_all()
 
     import api.ingest as ingest_module
-    client = TestClient(ingest_module.app)
+    client = TestClient(ingest_module.app, headers=auth_header())
 
     resp = client.post("/ingest", data={
         "org_id": TEST_ORG, "kind": "log",

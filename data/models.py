@@ -8,7 +8,7 @@ here, at the boundary, and routed to dead-letter rather than coerced.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Literal, Optional
 
@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field, field_validator
 
 
 def now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def new_id(prefix: str) -> str:
@@ -47,6 +47,8 @@ class Collection(str, Enum):
     AUDIT = "audit"
     RUNS = "runs"
     QUARANTINE = "quarantine"
+    CONNECTORS = "connectors"
+    CHANGE_EVENTS = "change_events"
     REGISTRY = "registry"  # global, not tenant-prefixed
 
 
@@ -61,9 +63,23 @@ Department = Literal["engineering", "support", "legal", "finance"]
 DraftKind = Literal["postmortem", "status_update", "gdpr_assessment", "sla_exposure"]
 DraftStatus = Literal["draft", "approved", "rejected"]
 Verdict = Literal["allow", "deny", "block", "redact"]
-RunStatus = Literal["running", "completed", "failed", "blocked", "denied", "quarantined"]
+RunStatus = Literal[
+    "running", "completed", "failed", "quarantined",
+    # Statuses Coordinator actually writes, previously missing:
+    "ok", "blocked", "denied", "degraded", "clarification_needed", "dead_letter",
+]
 AlertType = Literal["classified", "blocked", "denied", "quarantine"]
 AgentStatus = Literal["published", "deprecated"]
+
+# The set of statuses a *worker* can return (agents/contracts.py RunStatus)
+# is not the same set a *run record* can hold, but they overlap and the
+# run record must be able to store every one of them. RunStatus below
+# previously omitted "dead_letter", "degraded" and "clarification_needed"
+# entirely, while Coordinator wrote exactly those values - it got away
+# with it only because _touch_run() wrote a raw dict and skipped
+# validation. Firestore therefore held run documents that this model
+# declared illegal, and Run.model_validate() raised on precisely the runs
+# an operator most needs to inspect.
 
 
 # --------------------------------------------------------------------------
@@ -406,6 +422,95 @@ class IncidentClassified(BaseModel):
     classified_at: datetime = Field(default_factory=now)
 
 
+# --------------------------------------------------------------------------
+# Connectors - vendor-agnostic inbound ingestion
+#
+# Deliberately NOT one adapter class per vendor. A per-vendor adapter makes
+# every tool a customer already uses into a support request, which does not
+# scale past the tools we happened to anticipate.
+#
+# Instead the receiver accepts arbitrary JSON and stores it verbatim as
+# RawEvidence, and Intake - which already extracts structure from
+# unstructured evidence (alerts, logs, screenshots, Slack) - does the
+# normalisation. That is only viable because this system already has an
+# extraction agent; a platform doing deterministic field parsing genuinely
+# would need per-vendor code.
+#
+# What cannot be made generic is signature verification: there is no
+# standard, and GitHub, Datadog and Stripe each differ. That collapses to
+# a handful of configurable *strategies* rather than N adapters - see
+# connectors/verification.py.
+# --------------------------------------------------------------------------
+
+VerificationStrategy = Literal["hmac", "bearer", "ip_allowlist", "none"]
+
+
+class VerificationConfig(BaseModel):
+    """How to prove an inbound webhook really came from the configured tool.
+
+    The shared secret is NEVER stored here. This document lives in
+    Firestore and is readable by any identity with `connectors` read
+    scope; putting the signing key in it would make a read-scope grant
+    equivalent to the ability to forge events. `secret_ref` names an entry
+    in MORTEMTRACE_CONNECTOR_SECRETS (Secret Manager-backed), same
+    indirection the API token table uses.
+    """
+
+    strategy: VerificationStrategy = "hmac"
+    header: Optional[str] = None          # e.g. "X-Hub-Signature-256"
+    algorithm: Literal["sha256", "sha1"] = "sha256"
+    encoding: Literal["hex", "base64"] = "hex"
+    prefix: Optional[str] = None          # e.g. "sha256=" (GitHub)
+    secret_ref: Optional[str] = None      # key into MORTEMTRACE_CONNECTOR_SECRETS
+    allowed_ips: list[str] = Field(default_factory=list)
+
+
+class ConnectorConfig(BaseModel):
+    """One configured inbound webhook. Created as data, never as code.
+
+    `connector_id` is unguessable and forms part of the credential: the
+    URL alone is not sufficient when a signature strategy is configured,
+    but with strategy="none" it IS the only secret, which is why that
+    choice is warned about at registration time.
+    """
+
+    connector_id: str
+    org_id: str
+    name: str
+    source: str                            # "datadog", "github", or anything
+    kind: EvidenceKind = "alert"
+    verification: VerificationConfig = Field(default_factory=VerificationConfig)
+    # True routes the payload to change_events (deploy/merge/apply history)
+    # instead of opening or attaching to an incident.
+    is_change_source: bool = False
+    enabled: bool = True
+    created_at: datetime = Field(default_factory=now)
+
+
+ChangeKind = Literal["deploy", "merge", "rollback", "config_change", "infra_apply", "unknown"]
+
+
+class ChangeEvent(BaseModel):
+    """A deploy, merge, rollback, or infrastructure apply.
+
+    Most outages follow a change, and "what shipped just before this
+    broke?" was previously unanswerable by this system - there was nowhere
+    to record it. Diagnosis correlates these by time window against an
+    incident's opening.
+    """
+
+    change_id: str
+    org_id: str
+    source: str
+    kind: ChangeKind = "unknown"
+    service: Optional[str] = None
+    ref: Optional[str] = None              # commit sha, build number, PR id
+    actor: Optional[str] = None
+    summary: str
+    occurred_at: datetime = Field(default_factory=now)
+    raw: dict = Field(default_factory=dict)
+
+
 class DeadLetter(BaseModel):
     original_topic: str
     run_id: str
@@ -414,3 +519,114 @@ class DeadLetter(BaseModel):
     payload: dict
     attempt_count: int = 0
     failed_at: datetime = Field(default_factory=now)
+
+
+# --------------------------------------------------------------------------
+# Human identity, organizations, and membership
+#
+# A deliberately separate trust model from OrgClaim above. OrgClaim
+# answers "may this AGENT touch this TENANT's incident data" for the
+# multi-agent fleet - a question with no concept of an individual person.
+# The models below answer "which org(s) does this AUTHENTICATED HUMAN
+# belong to, and what may they administer there" - resolved once, at the
+# console's login boundary, before an ordinary OrgClaim is minted for
+# whichever org that resolves to. Neither system trusts the other; the
+# console is what sits between them.
+#
+# Stored in global (non-tenant-scoped) Firestore collections, the same
+# pattern already used for /registry and /connectors and for the same
+# reason: a user or an invitation is not naturally owned by one tenant
+# the way incident data is, so authorization here is enforced by explicit
+# checks in data/scope_store.py's identity functions, not by the
+# claim-based tenant match every other collection gets automatically.
+# --------------------------------------------------------------------------
+
+MembershipRole = Literal["admin", "member"]
+MembershipStatus = Literal["active", "revoked"]
+InvitationStatus = Literal["pending", "redeemed", "revoked"]
+
+
+class OrgSsoConfig(BaseModel):
+    """One organization's own OIDC identity provider (Entra ID, Okta,
+    Auth0, a private Keycloak - anything OIDC-compliant).
+
+    Optional: an org with no SsoConfig simply has no entry here, and its
+    members authenticate via the Google fallback instead. `client_secret_ref`
+    names an entry in MORTEMTRACE_OIDC_CLIENT_SECRETS (Secret Manager-backed),
+    the same indirection connectors and API tokens already use - never a
+    plaintext secret sitting in a Firestore document.
+    """
+
+    issuer: str                            # e.g. "https://login.microsoftonline.com/{tenant}/v2.0"
+    client_id: str
+    client_secret_ref: str
+    domain_hint: Optional[str] = None      # e.g. "acme.com" - drives Home Realm Discovery
+
+
+class Organization(BaseModel):
+    """One customer tenant's identity/membership record.
+
+    `org_id` is server-generated (never a human-chosen slug) so it can
+    double as the Firestore path segment every tenant-scoped collection
+    already keys on, with no separate mapping table and no squatting
+    concern. `display_name` is the free-form human-facing name instead.
+    """
+
+    org_id: str
+    display_name: str
+    created_at: datetime = Field(default_factory=now)
+    created_by: str                        # user_id of the founding admin
+    sso: Optional[OrgSsoConfig] = None
+    # Verified corporate email domains (lowercase, no leading "@") that
+    # auto-join as "member" on first login - the standard enterprise SSO
+    # pattern of "anyone with a company address is already trusted to be
+    # an employee." Admins still have to be promoted explicitly.
+    auto_join_domains: list[str] = Field(default_factory=list)
+    # Exactly one organization in a real deployment should ever set this:
+    # the seeded demo tenant. Grants "member" (never higher, regardless of
+    # any other configuration) to any authenticated identity that
+    # explicitly chose the "view live demo" entry point - never a silent
+    # side effect of an ordinary login landing on this org by coincidence.
+    public_demo_auto_join: bool = False
+
+
+class User(BaseModel):
+    """One human, identified by a stable hash of their IdP identity - not
+    by email, which can be reassigned or changed at the IdP."""
+
+    user_id: str                           # sha256(f"{issuer}|{sub}")[:24]
+    email: str
+    display_name: str
+    created_at: datetime = Field(default_factory=now)
+    last_login_at: datetime = Field(default_factory=now)
+
+
+class Membership(BaseModel):
+    """One (user, org) grant. A user with memberships in several orgs is
+    simply several of these rows - the multi-org case needs no separate
+    modelling."""
+
+    membership_id: str                     # f"{user_id}__{org_id}"
+    user_id: str
+    org_id: str
+    role: MembershipRole
+    status: MembershipStatus = "active"
+    invited_by: Optional[str] = None       # user_id, None for the founding admin
+    created_at: datetime = Field(default_factory=now)
+
+
+class Invitation(BaseModel):
+    """A pending grant, redeemable by whoever authenticates with the
+    invited email address. `token_hash` only - the same digest-not-secret
+    pattern MORTEMTRACE_API_TOKENS uses, so a Firestore export never hands
+    out a live invite."""
+
+    invitation_id: str
+    org_id: str
+    email: str                             # lowercased at creation
+    role: MembershipRole
+    invited_by: str                        # user_id
+    token_hash: str
+    status: InvitationStatus = "pending"
+    created_at: datetime = Field(default_factory=now)
+    expires_at: datetime

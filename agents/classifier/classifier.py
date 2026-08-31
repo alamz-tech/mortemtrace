@@ -16,6 +16,7 @@ to actually emit, not one we defaulted on its behalf.
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -35,6 +36,12 @@ from data.models import (
 from gateway import agent_gateway
 
 logger = logging.getLogger("mortemtrace.classifier")
+
+
+class _IncidentMissing(Exception):
+    """Raised inside the backfill transaction when the incident document
+    does not exist. Distinguished from a genuine store failure so the two
+    are not logged as the same thing."""
 
 AGENT_NAME = "classifier"
 
@@ -115,6 +122,7 @@ def run(claim: OrgClaim, envelope: Envelope) -> RunResult:
         data_categories=draft.data_categories if draft.data_touched else [],
     )
     scope_store.write(claim, Collection.CLASSIFICATION, incident_id, classification.model_dump(mode="json"))
+    _backfill_incident_summary(claim, incident_id, classification)
     if classification.data_touched:
         logger.warning(
             "incident %s classified data_touched=true (run=%s); GDPR clock trigger emitted to Compliance",
@@ -135,6 +143,57 @@ def run(claim: OrgClaim, envelope: Envelope) -> RunResult:
         )],
         tokens_used=invoked.tokens_used, turns=invoked.turns,
     )
+
+
+def _backfill_incident_summary(claim: OrgClaim, incident_id: str, classification: Classification) -> None:
+    """Copies severity and affected services onto the Incident record.
+
+    `Incident.severity` and `Incident.services_affected` exist in the
+    schema and are rendered by the dashboard's incident table, but
+    api/ingest.py cannot populate them: at ingest time nothing has read
+    the evidence yet, so severity is genuinely unknown. Classification
+    is where they first become known, and nothing was carrying them
+    back - so every real incident displayed "—" in both columns forever,
+    while the seeded demo incidents showed values (seed/generate.py
+    writes them directly) and made the gap look like a data problem
+    rather than a missing write.
+
+    Goes through update_in_transaction, not read()+write(): this touches
+    only two derived fields on a document whose `status` is owned by the
+    incident's own lifecycle and whose `opened_at` is owned by ingest.
+    A read-modify-write via the plain pair would race Watcher's status
+    transitions and could silently revert one.
+
+    Degrade-not-fail: the classification itself is already durably
+    written and is the source of truth. If this convenience denormali-
+    sation fails, the incident detail page still renders severity from
+    Classification - so a failure here is logged and swallowed rather
+    than dead-lettering a run whose real work already succeeded.
+    """
+    def _apply(current: Optional[dict]) -> dict:
+        if current is None:
+            # Nothing to enrich - the incident document should always
+            # exist by now (ingest creates it before any agent runs), so
+            # this is a real anomaly worth surfacing rather than silently
+            # creating a partial incident record from classifier output.
+            raise _IncidentMissing(incident_id)
+        updated = dict(current)
+        updated["severity"] = classification.severity
+        updated["services_affected"] = classification.services
+        return updated
+
+    try:
+        scope_store.update_in_transaction(claim, Collection.INCIDENTS, incident_id, _apply)
+    except _IncidentMissing:
+        logger.warning(
+            "incident %s has no document to enrich; classification written but the "
+            "dashboard's severity column will stay empty for it", incident_id,
+        )
+    except Exception:
+        logger.warning(
+            "could not backfill severity/services onto incident %s; the Classification "
+            "record is authoritative and unaffected", incident_id, exc_info=True,
+        )
 
 
 def _build_prompt(timeline: Timeline) -> str:

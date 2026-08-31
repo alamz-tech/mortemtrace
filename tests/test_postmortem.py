@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import json
 
+from agents.departments.postmortem import postmortem
 from data import scope_store
 from data.models import Collection, Envelope, OrgClaim
-from agents.departments.postmortem import postmortem
 from tests.conftest import TEST_ORG, seed_agent, stub_gateway
 
 INCIDENT_ID = "inc_1"

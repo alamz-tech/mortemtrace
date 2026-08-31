@@ -5,9 +5,11 @@ always monkeypatched here - these tests must never call real Gemini.
 """
 from __future__ import annotations
 
+import json
+
+from agents.diagnosis import diagnosis
 from data import scope_store
 from data.models import Collection, Envelope, MemoryRecord, OrgClaim
-from agents.diagnosis import diagnosis
 from gateway import agent_gateway
 from tests.conftest import TEST_ORG, seed_agent
 
@@ -271,3 +273,113 @@ def test_diagnosis_model_armor_block_writes_nothing(fake_db, monkeypatch):
     assert result.status == "blocked"
     assert "injection" in result.detail.lower()
     assert _hypotheses(fake_db) == []
+
+
+# --------------------------------------------------------------------------
+# Change correlation: "what shipped just before this broke?"
+# --------------------------------------------------------------------------
+
+def _seed_change(fake_db, change_id, occurred_at, service="checkout-api", summary="deploy"):
+    fake_db.seed(f"tenants/{TEST_ORG}/change_events/{change_id}", {
+        "change_id": change_id, "org_id": TEST_ORG, "source": "github",
+        "kind": "deploy", "service": service, "ref": "abc123", "actor": "alice",
+        "summary": summary, "occurred_at": occurred_at, "raw": {},
+    })
+
+
+def test_recent_changes_included_in_the_prompt(fake_db, monkeypatch):
+    seed_agent(fake_db, "diagnosis", "1.0.0",
+               read_scopes=[Collection.TIMELINE, Collection.MEMORY, Collection.CHANGE_EVENTS],
+               write_scopes=[Collection.HYPOTHESES])
+    _seed_timeline(fake_db)
+    _seed_change(fake_db, "chg_before", "2026-08-25T03:00:00+00:00", summary="deployed build 42")
+
+    captured = {}
+
+    def _capture(agent, prompt, *, run_id, org_id):
+        captured["prompt"] = prompt
+        return agent_gateway.InvokeResult(
+            text=json.dumps({"statement": "OOM after deploy", "confidence": 0.8,
+                             "source_entry_indices": [0], "prior_incident_refs": []}),
+            tokens_used=10, turns=1,
+        )
+
+    monkeypatch.setattr(agent_gateway, "build_agent",
+                        lambda **kw: (object(), agent_gateway.InvocationOutcome()))
+    monkeypatch.setattr(agent_gateway, "invoke", _capture)
+
+    result = diagnosis.run(_claim(), _envelope())
+
+    assert result.status == "ok"
+    assert "deployed build 42" in captured["prompt"]
+    assert "Changes deployed shortly BEFORE" in captured["prompt"]
+
+
+def test_changes_after_the_incident_are_excluded(fake_db, monkeypatch):
+    """A deploy that happened *after* the incident opened cannot have
+    caused it; including it invites a confident wrong hypothesis."""
+    seed_agent(fake_db, "diagnosis", "1.0.0",
+               read_scopes=[Collection.TIMELINE, Collection.MEMORY, Collection.CHANGE_EVENTS],
+               write_scopes=[Collection.HYPOTHESES])
+    _seed_timeline(fake_db)
+    _seed_change(fake_db, "chg_after", "2026-08-25T09:00:00+00:00", summary="LATER deploy")
+
+    captured = {}
+    monkeypatch.setattr(agent_gateway, "build_agent",
+                        lambda **kw: (object(), agent_gateway.InvocationOutcome()))
+    monkeypatch.setattr(agent_gateway, "invoke",
+                        lambda a, p, *, run_id, org_id: captured.update(prompt=p) or
+                        agent_gateway.InvokeResult(
+                            text=json.dumps({"statement": "s", "confidence": 0.5,
+                                             "source_entry_indices": [0], "prior_incident_refs": []}),
+                            tokens_used=1, turns=1))
+
+    diagnosis.run(_claim(), _envelope())
+
+    assert "LATER deploy" not in captured["prompt"]
+    assert "No change events recorded" in captured["prompt"]
+
+
+def test_missing_change_scope_degrades_rather_than_failing(fake_db, monkeypatch):
+    """An org with no change connector configured is the common case and
+    must not fail the run - correlation is enrichment, not a prerequisite."""
+    seed_agent(fake_db, "diagnosis", "1.0.0",
+               read_scopes=[Collection.TIMELINE, Collection.MEMORY],  # no CHANGE_EVENTS
+               write_scopes=[Collection.HYPOTHESES])
+    _seed_timeline(fake_db)
+
+    monkeypatch.setattr(agent_gateway, "build_agent",
+                        lambda **kw: (object(), agent_gateway.InvocationOutcome()))
+    monkeypatch.setattr(agent_gateway, "invoke",
+                        lambda a, p, *, run_id, org_id: agent_gateway.InvokeResult(
+                            text=json.dumps({"statement": "s", "confidence": 0.5,
+                                             "source_entry_indices": [0], "prior_incident_refs": []}),
+                            tokens_used=1, turns=1))
+
+    assert diagnosis.run(_claim(), _envelope()).status == "ok"
+
+
+def test_mixed_timezone_formats_are_ordered_correctly(fake_db, monkeypatch):
+    """A change written with a 'Z' suffix and one with '+00:00' represent
+    the same kind of instant, but sort differently as raw strings. The
+    window must be decided on parsed datetimes, not lexicographically."""
+    seed_agent(fake_db, "diagnosis", "1.0.0",
+               read_scopes=[Collection.TIMELINE, Collection.MEMORY, Collection.CHANGE_EVENTS],
+               write_scopes=[Collection.HYPOTHESES])
+    _seed_timeline(fake_db)
+    _seed_change(fake_db, "chg_z", "2026-08-25T02:30:00Z", summary="Z-suffixed deploy")
+    _seed_change(fake_db, "chg_offset", "2026-08-25T02:45:00+00:00", summary="offset deploy")
+
+    captured = {}
+    monkeypatch.setattr(agent_gateway, "build_agent",
+                        lambda **kw: (object(), agent_gateway.InvocationOutcome()))
+    monkeypatch.setattr(agent_gateway, "invoke",
+                        lambda a, p, *, run_id, org_id: captured.update(prompt=p) or
+                        agent_gateway.InvokeResult(
+                            text=json.dumps({"statement": "s", "confidence": 0.5,
+                                             "source_entry_indices": [0], "prior_incident_refs": []}),
+                            tokens_used=1, turns=1))
+
+    diagnosis.run(_claim(), _envelope())
+
+    assert "offset deploy" in captured["prompt"]

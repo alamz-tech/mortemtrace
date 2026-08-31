@@ -31,7 +31,7 @@ call). Most workers will only ever append zero or one entry.
 """
 from __future__ import annotations
 
-from typing import Literal, Optional, Protocol
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field
 

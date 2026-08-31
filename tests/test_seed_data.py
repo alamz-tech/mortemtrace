@@ -54,6 +54,22 @@ def test_timeline_source_event_ids_all_trace_to_real_events(fake_db):
             assert source_id in real_event_ids, f"dangling source_event_id: {source_id}"
 
 
+def test_public_demo_flag_writes_an_organization_record(fake_db):
+    generate(TEST_ORG, public_demo=True)
+
+    org = scope_store.get_organization(TEST_ORG)
+    assert org is not None
+    assert org["public_demo_auto_join"] is True
+
+
+def test_without_the_flag_no_organization_record_is_written(fake_db):
+    """The default, unflagged path must not accidentally make ANY org
+    public-demo-joinable - this is the control for the test above."""
+    generate(TEST_ORG, public_demo=False)
+
+    assert scope_store.get_organization(TEST_ORG) is None
+
+
 def test_exactly_one_incident_matches_watchers_real_default_sweep(fake_db):
     """The actual proof: import Watcher's real _sweep, run it against
     this seed data with no injected_signal (Watcher's default mock feed

@@ -1,0 +1,120 @@
+# Dependency lock for MortemTrace.
+#
+# pyproject.toml declares compatible version *ranges*, which is right for a
+# library but insufficient for a deployable service: without pinning, two
+# builds of the same commit can install different versions. That is not a
+# hypothetical risk here - a google-adk minor release changed how model-call
+# exceptions propagate through its sync Runner, which this codebase's retry
+# and model-fallback behaviour depends on.
+#
+# GENERATED ON PYTHON 3.11 - the version the container and Cloud Run run.
+# This matters: an earlier version of this file was frozen from a 3.13
+# development environment and pinned grpcio to a release with no cp311
+# wheel, which made `pip install -c constraints.txt` unresolvable inside
+# the very image it was meant to pin. A lockfile must be generated on the
+# runtime it locks.
+#
+# Regenerate after changing a dependency range in pyproject.toml:
+#   docker run --rm -v "$PWD":/src -w /src python:3.11-slim sh -c \
+#     'pip install -q -e ".[dev]" && pip freeze --exclude-editable' \
+#     | grep -v "^-e\|^mortemtrace" | sort
+#
+# Then re-run the full suite on 3.11 before committing.
+Authlib==1.7.2
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+PyYAML==6.0.3
+Pygments==2.21.0
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.3
+aiosignal==1.4.0
+aiosqlite==0.22.1
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.14.2
+asgiref==3.12.1
+attrs==26.1.0
+certifi==2026.7.22
+cffi==2.1.1
+charset-normalizer==3.5.1
+click==8.5.0
+cryptography==50.0.1
+distro==1.9.0
+docstring_parser==0.18.0
+fastapi==0.141.1
+frozenlist==1.8.0
+google-adk==2.7.1
+google-api-core==2.34.0
+google-auth==2.57.0
+google-cloud-aiplatform==1.165.1
+google-cloud-appengine-logging==1.10.0
+google-cloud-audit-log==0.6.2
+google-cloud-bigquery==3.44.0
+google-cloud-core==2.7.0
+google-cloud-firestore==2.29.0
+google-cloud-logging==3.16.3
+google-cloud-modelarmor==0.7.1
+google-cloud-pubsub==2.39.2
+google-cloud-resource-manager==1.18.0
+google-cloud-storage==3.13.1
+google-cloud-trace==1.20.0
+google-crc32c==1.8.0
+google-genai==2.20.0
+google-resumable-media==2.10.2
+googleapis-common-protos==1.75.2
+graphviz==0.21
+grpc-google-iam-v1==0.14.5
+grpcio-status==1.83.0
+grpcio==1.83.0
+h11==0.16.0
+httpcore==1.0.9
+httptools==0.8.0
+httpx==0.28.1
+idna==3.19
+iniconfig==2.3.0
+joserfc==1.7.4
+jsonschema-specifications==2025.9.1
+jsonschema==4.26.0
+multidict==6.7.1
+opentelemetry-api==1.42.1
+opentelemetry-exporter-gcp-trace==1.15.0
+opentelemetry-instrumentation-asgi==0.63b1
+opentelemetry-instrumentation-fastapi==0.63b1
+opentelemetry-instrumentation==0.63b1
+opentelemetry-resourcedetector-gcp==1.14.0
+opentelemetry-sdk==1.42.1
+opentelemetry-semantic-conventions==0.63b1
+opentelemetry-util-http==0.63b1
+packaging==26.3
+pluggy==1.6.0
+propcache==0.5.2
+proto-plus==1.28.4
+protobuf==6.33.6
+pyasn1==0.6.4
+pyasn1_modules==0.4.2
+pycparser==3.0
+pydantic==2.13.4
+pydantic_core==2.46.4
+pytest-asyncio==0.26.0
+pytest==8.4.2
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.3
+python-multipart==0.0.32
+referencing==0.37.0
+requests==2.34.2
+rpds-py==2026.6.3
+six==1.17.0
+sniffio==1.3.1
+starlette==1.6.0
+tenacity==9.1.4
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+tzlocal==5.4.4
+urllib3==2.7.0
+uvicorn==0.52.4
+uvloop==0.22.1
+watchdog==6.0.0
+watchfiles==1.2.0
+websockets==15.0.1
+wrapt==2.3.0
+yarl==1.24.5

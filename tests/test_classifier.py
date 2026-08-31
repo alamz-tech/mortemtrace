@@ -7,9 +7,9 @@ Gemini from this file.
 """
 from __future__ import annotations
 
+from agents.classifier import classifier
 from data import scope_store
 from data.models import Collection, Envelope, OrgClaim
-from agents.classifier import classifier
 from gateway import agent_gateway
 from tests.conftest import TEST_ORG, seed_agent
 
@@ -43,9 +43,24 @@ def _seed_timeline(fake_db, incident_id: str = "inc_1", entries: list[dict] | No
 def _seed_classifier_agent(fake_db) -> None:
     seed_agent(
         fake_db, "classifier", "1.0.0",
-        read_scopes=[Collection.TIMELINE, Collection.RAW_EVIDENCE],
-        write_scopes=[Collection.CLASSIFICATION],
+        read_scopes=[Collection.TIMELINE, Collection.RAW_EVIDENCE, Collection.INCIDENTS],
+        write_scopes=[Collection.CLASSIFICATION, Collection.INCIDENTS],
     )
+
+
+def _seed_incident(fake_db, incident_id: str = "inc_1") -> None:
+    """An incident as api/ingest.py actually creates it: no severity and
+    no services_affected, because at ingest time nothing has read the
+    evidence yet."""
+    fake_db.seed(f"tenants/{TEST_ORG}/incidents/{incident_id}", {
+        "incident_id": incident_id, "org_id": TEST_ORG,
+        "opened_at": "2026-08-25T02:55:00Z", "resolved_at": None,
+        "status": "open", "severity": None, "services_affected": [], "alert_source": None,
+    })
+
+
+def _incident(fake_db, incident_id: str = "inc_1") -> dict | None:
+    return fake_db._docs.get(("tenants", TEST_ORG, "incidents", incident_id))
 
 
 def _classification(fake_db, incident_id: str = "inc_1") -> dict | None:
@@ -199,3 +214,75 @@ def test_classifier_model_armor_block_writes_nothing(fake_db, monkeypatch):
     assert "injection" in result.detail.lower()
     assert _classification(fake_db) is None
     assert result.next_events == []
+
+
+# --------------------------------------------------------------------------
+# Incident enrichment
+#
+# Regression: Classification is where severity and affected services
+# first become known, but nothing carried them back to the Incident
+# record the dashboard's incident table actually renders - so every real
+# incident showed "—" in both columns permanently, while seeded demo
+# incidents showed values and made it look like a data problem rather
+# than a missing write.
+# --------------------------------------------------------------------------
+
+def _stub_classification(monkeypatch, severity: str = "sev1", services: list[str] | None = None) -> None:
+    import json as _json
+    payload = {
+        "severity": severity, "services": services if services is not None else ["checkout-api"],
+        "downtime_windows": [], "data_touched": False, "data_categories": [],
+    }
+    monkeypatch.setattr(
+        "gateway.agent_gateway.invoke",
+        lambda agent, prompt, **kw: agent_gateway.InvokeResult(
+            text=_json.dumps(payload), tokens_used=70, turns=1,
+        ),
+    )
+
+
+def test_classifier_backfills_severity_and_services_onto_the_incident(fake_db, monkeypatch):
+    _seed_classifier_agent(fake_db)
+    _seed_timeline(fake_db)
+    _seed_incident(fake_db)
+    _stub_classification(monkeypatch, severity="sev1", services=["checkout-api", "orders-db"])
+
+    result = classifier.run(_claim(), _envelope())
+
+    assert result.status == "ok"
+    incident = _incident(fake_db)
+    assert incident["severity"] == "sev1"
+    assert incident["services_affected"] == ["checkout-api", "orders-db"]
+
+
+def test_backfill_preserves_fields_it_does_not_own(fake_db, monkeypatch):
+    """status and opened_at belong to the incident lifecycle and to
+    ingest respectively. A full-document overwrite here would race
+    Watcher's own status transitions and could silently revert one."""
+    _seed_classifier_agent(fake_db)
+    _seed_timeline(fake_db)
+    _seed_incident(fake_db)
+    fake_db._docs[("tenants", TEST_ORG, "incidents", "inc_1")]["status"] = "monitoring"
+    _stub_classification(monkeypatch)
+
+    classifier.run(_claim(), _envelope())
+
+    incident = _incident(fake_db)
+    assert incident["status"] == "monitoring"          # not clobbered
+    assert incident["opened_at"] == "2026-08-25T02:55:00Z"
+    assert incident["severity"] == "sev1"              # still enriched
+
+
+def test_classification_still_succeeds_when_the_incident_is_missing(fake_db, monkeypatch):
+    """The Classification record is the source of truth; the incident
+    copy is a convenience denormalisation. A missing incident document
+    must not dead-letter a run whose real work already succeeded."""
+    _seed_classifier_agent(fake_db)
+    _seed_timeline(fake_db)
+    # deliberately no _seed_incident
+    _stub_classification(monkeypatch)
+
+    result = classifier.run(_claim(), _envelope())
+
+    assert result.status == "ok"
+    assert _classification(fake_db)["severity"] == "sev1"

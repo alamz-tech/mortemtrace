@@ -7,10 +7,14 @@ extraction/reasoning happens downstream (Intake, via Coordinator) -
 this module never imports Vertex/Gemini and never reasons about
 incident content itself.
 
-Identity: every request mints a fresh "ingest-api" claim via
-scope_store.sign_claim(). This is a registry-scope requirement for
-whoever seeds the agent registry (infra/init_firestore.py) - flagged
-here and in the implementation report:
+Identity: the caller is authenticated first (auth/identity.py), and the
+tenant is taken from the resulting Principal - never from the request
+body. Only then is an "ingest-api" claim minted via
+scope_store.sign_claim() for that verified tenant. The claim signature
+gives integrity to the org_id; authentication is what establishes that
+the caller was entitled to that org_id in the first place. Before the
+two were separated, `org_id` was an unauthenticated form field that the
+server dutifully signed, so any caller could write into any tenant.
 
     ingest-api @ 1.0.0 needs:
         write_scopes: [Collection.INCIDENTS, Collection.RAW_EVIDENCE]
@@ -33,16 +37,18 @@ import concurrent.futures
 import json
 import logging
 import os
+import re
 import threading
 from typing import Optional
 
-import google.auth.transport.requests
-import google.oauth2.id_token
-from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from google.cloud import pubsub_v1
 
 from agents import wiring
 from agents.coordinator import coordinator
+from auth import identity
+from connectors import registry as connector_registry
+from connectors import verification
 from data import scope_store
 from data.models import (
     Collection,
@@ -70,17 +76,75 @@ _PUSH_AUDIENCE_ENV = "MORTEMTRACE_PUSH_AUDIENCE"
 # Small images only: base64-encoded straight into RawEvidence.payload as a
 # data: URI. A real deployment would stream the upload to Cloud Storage
 # and store a media_uri instead; base64-into-payload is a deliberate
-# hackathon-scope shortcut (documented in the implementation report), not
-# an oversight - it keeps ingest.py free of a second infra dependency
-# (bucket provisioning, signed URLs) for a P0 endpoint that must respond
-# in under 500ms. Truncated rather than rejected past this size so a demo
-# screenshot never turns into a 4xx on stage.
-_MAX_INLINE_FILE_BYTES = 5 * 1024 * 1024  # 5MB
+# hackathon-scope shortcut, not an oversight - it keeps ingest.py free of
+# a second infra dependency (bucket provisioning, signed URLs) for a P0
+# endpoint that must respond in under 500ms.
+#
+# The ceiling is derived from Firestore's hard 1 MiB document limit, not
+# picked: base64 inflates by 4/3, and the surrounding RawEvidence fields
+# and the "data:<mime>;base64," prefix also count against the same limit.
+# This previously truncated at 5 MB, which silently guaranteed failure -
+# a 5 MB file becomes ~7 MB of base64, ~6.7x over the limit, so every
+# upload above ~768 KB (a normal dashboard screenshot) produced an opaque
+# 500 from the Firestore write. Oversized uploads are now rejected at the
+# boundary with a 413 that says the actual limit, instead of truncating
+# into a payload that cannot be stored.
+_FIRESTORE_MAX_DOC_BYTES = 1_048_576
+_DOC_OVERHEAD_BYTES = 4096  # other RawEvidence fields + data: URI prefix + Firestore field overhead
+_MAX_INLINE_FILE_BYTES = ((_FIRESTORE_MAX_DOC_BYTES - _DOC_OVERHEAD_BYTES) * 3) // 4
+
+# Same reasoning for the text path: a pasted log body is stored in the
+# same single Firestore field and is just as capable of exceeding 1 MiB.
+_MAX_TEXT_PAYLOAD_BYTES = _FIRESTORE_MAX_DOC_BYTES - _DOC_OVERHEAD_BYTES
 
 otel_setup.init_telemetry("mortemtrace-ingest-api")
+otel_setup.configure_logging("mortemtrace-ingest-api")
+identity.warn_if_open()
 wiring.register_all()
 
 app = FastAPI(title="MortemTrace Ingest API")
+
+_INGEST_LIMITER = identity.build_ingest_limiter()
+# Webhooks come from machines, not people, so a legitimate source can
+# burst far higher than an operator would - but it still fans out into
+# paid model calls, so it is bounded rather than unlimited.
+_WEBHOOK_LIMITER = identity.build_webhook_limiter()
+
+
+def _authenticate(authorization: Optional[str], requested_org: Optional[str]) -> str:
+    """Authenticate, then resolve the tenant. Returns the org_id this
+    request is entitled to act as, which is the only org_id anything
+    downstream is allowed to see."""
+    try:
+        principal = identity.authenticate(authorization)
+        org_id = principal.authorize_org(requested_org)
+    except identity.AuthenticationError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except identity.AuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except identity.InvalidOrgId as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        _INGEST_LIMITER.check(org_id)
+    except identity.RateLimitExceeded as exc:
+        # Ingest fans out into a chain of paid model calls, so an
+        # unbounded caller is a cost-exhaustion vector, not just a load one.
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    return org_id
+
+
+# A caller-supplied incident_id is written straight into a Firestore
+# document path, so it needs the same slash/charset guard as org_id -
+# Firestore reads "a/b" as two path segments, which silently re-points
+# the write rather than failing loudly.
+_INCIDENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+
+def _validate_incident_id(incident_id: str) -> str:
+    if not _INCIDENT_ID_RE.match(incident_id):
+        raise HTTPException(status_code=400, detail=f"invalid incident_id: {incident_id!r}")
+    return incident_id
 
 
 # --------------------------------------------------------------------------
@@ -180,7 +244,14 @@ def _publish_pubsub(topic: str, payload: dict) -> None:
     client = _pubsub_client()
     topic_path = client.topic_path(project, topic)
     data = json.dumps(payload, default=str).encode("utf-8")
-    future = client.publish(topic_path, data)
+
+    # W3C trace context travels as message attributes so the whole
+    # ingest-to-drafts chain is one trace. Without this, each Pub/Sub hop
+    # started a fresh root span and a single incident appeared in Cloud
+    # Trace as five unrelated traces - R10's "one trace for the chain"
+    # was unachievable no matter how consistent the span attributes were.
+    attributes = otel_setup.inject_trace_context({})
+    future = client.publish(topic_path, data, **attributes)
     future.add_done_callback(lambda f: _log_publish_failure(f, topic))
 
 
@@ -208,23 +279,51 @@ async def _resolve_payload(payload: Optional[str], file: Optional[UploadFile]) -
     `payload` (alert JSON / pasted logs / Slack text) or `file` (a
     dashboard screenshot) is expected per the request; a screenshot is
     base64-encoded directly into `payload` as a data: URI rather than
-    written to Cloud Storage - see the module docstring."""
+    written to Cloud Storage - see the module docstring.
+
+    Raises HTTPException(413) rather than truncating: a truncated
+    screenshot is both unusable evidence and, above ~768 KB, still too
+    large for Firestore once base64-encoded, so truncation traded a clear
+    4xx for an opaque 500.
+    """
     if file is not None:
         raw = await file.read()
         if len(raw) > _MAX_INLINE_FILE_BYTES:
-            raw = raw[:_MAX_INLINE_FILE_BYTES]
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"file is {len(raw)} bytes; the maximum is {_MAX_INLINE_FILE_BYTES} "
+                    f"bytes (~{_MAX_INLINE_FILE_BYTES // 1024} KB) because evidence is "
+                    "stored base64-encoded inside a single Firestore document (1 MiB limit)"
+                ),
+            )
         encoded = base64.b64encode(raw).decode("ascii")
         content_type = file.content_type or "application/octet-stream"
         return f"data:{content_type};base64,{encoded}"
-    return payload or ""
+
+    text = payload or ""
+    encoded_len = len(text.encode("utf-8"))
+    if encoded_len > _MAX_TEXT_PAYLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"payload is {encoded_len} bytes; the maximum is "
+                f"{_MAX_TEXT_PAYLOAD_BYTES} bytes (Firestore 1 MiB document limit)"
+            ),
+        )
+    return text
 
 
 # --------------------------------------------------------------------------
 # Routes
 # --------------------------------------------------------------------------
 
-@app.get("/healthz")
-def healthz() -> dict:
+@app.get("/status")
+def status() -> dict:
+    """Not /healthz: confirmed live (2026-08-31) that Google's own edge
+    infrastructure intercepts that exact path ahead of Cloud Run, so a
+    route there is silently unreachable regardless of what it returns -
+    see console/ui.py's matching route for the full explanation."""
     return {"status": "ok"}
 
 
@@ -299,21 +398,137 @@ def _handle_ingest(org_id: str, kind: EvidenceKind, incident_id: Optional[str], 
 
 @app.post("/ingest")
 async def ingest(
-    org_id: str = Form(...),
     kind: EvidenceKind = Form(...),
+    org_id: Optional[str] = Form(None),
     incident_id: Optional[str] = Form(None),
     payload: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
+    authorization: Optional[str] = Header(None),
 ):
+    """`org_id` is now optional and, when supplied, may only *select*
+    among tenants the presented credential already grants - it can never
+    introduce one. A single-tenant credential resolves it implicitly."""
+    resolved_org = _authenticate(authorization, org_id)
+    if incident_id is not None:
+        _validate_incident_id(incident_id)
     body_text = await _resolve_payload(payload, file)
-    return await asyncio.to_thread(_handle_ingest, org_id, kind, incident_id, body_text)
+    return await asyncio.to_thread(_handle_ingest, resolved_org, kind, incident_id, body_text)
 
 
-def _handle_watcher_sweep(body: dict) -> dict:
+def _handle_webhook(config, payload: dict) -> dict:
+    """Blocking work for one inbound webhook, off the event loop.
+
+    Two destinations, chosen by the connector's own configuration:
+
+    * A change source (GitHub Actions, Jenkins, Terraform) writes a
+      ChangeEvent. It does not open an incident - a deploy is not an
+      outage - but it becomes correlatable history for whichever incident
+      opens next.
+    * Everything else becomes RawEvidence and enters the normal
+      Intake -> Ledger -> fan-out pipeline, exactly as a /ingest call
+      would. No vendor-specific parsing: the payload is summarised into
+      evidence text and Intake extracts meaning from it, which is the
+      whole reason this receiver does not need an adapter per tool.
+    """
+    org_id = config.org_id
+    run_id = new_id("run")
+    claim = _ingest_claim(org_id, run_id)
+
+    if config.is_change_source:
+        change = connector_registry.to_change_event(config, payload)
+        scope_store.write(
+            claim, Collection.CHANGE_EVENTS, change.change_id, change.model_dump(mode="json"),
+        )
+        otel_setup.record_metric(
+            "change_event_received", source=config.source, org_id=org_id, run_id=run_id,
+        )
+        logger.info(
+            "change event %s recorded from %s", change.change_id, config.source,
+            extra={"run_id": run_id, "org_id": org_id},
+        )
+        return {"status": "recorded", "change_id": change.change_id, "kind": change.kind}
+
+    body_text = connector_registry.summarize(config.source, payload, limit=_MAX_TEXT_PAYLOAD_BYTES)
+    result = _handle_ingest(org_id, config.kind, None, body_text)
+    otel_setup.record_metric(
+        "webhook_ingested", source=config.source, org_id=org_id, run_id=result["run_id"],
+    )
+    return result
+
+
+@app.post("/webhook/{connector_id}")
+async def webhook(connector_id: str, request: Request):
+    """The universal inbound receiver: any tool, any JSON, no adapter.
+
+    Authentication here is the connector's configured signature strategy
+    (connectors/verification.py), not an API token - a third-party tool
+    cannot present one of ours. The tenant comes from the connector
+    document, so it is never taken from the request body.
+
+    The raw body is read before parsing because HMAC strategies sign the
+    exact bytes sent; re-serialising a parsed dict would not reproduce
+    them (key order, separators and unicode escaping all differ) and every
+    signature check would fail.
+    """
+    if not connector_registry.valid_connector_id(connector_id):
+        raise HTTPException(status_code=404, detail="no such connector")
+
+    raw_body = await request.body()
+    if len(raw_body) > _MAX_TEXT_PAYLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"webhook body exceeds {_MAX_TEXT_PAYLOAD_BYTES} bytes",
+        )
+    headers = {k.lower(): v for k, v in request.headers.items()}
+
+    try:
+        config = await asyncio.to_thread(connector_registry.load, None, connector_id)
+    except connector_registry.UnknownConnector:
+        # Same response for "no such connector" and "disabled", so the
+        # endpoint is not an oracle for which ids exist.
+        raise HTTPException(status_code=404, detail="no such connector") from None
+
+    try:
+        verification.verify(config, headers, raw_body)
+    except verification.VerificationFailed as exc:
+        logger.warning(
+            "rejected webhook for connector %s: %s", connector_id, exc,
+            extra={"org_id": config.org_id},
+        )
+        otel_setup.record_metric(
+            "webhook_rejected", source=config.source, org_id=config.org_id,
+        )
+        raise HTTPException(status_code=401, detail="signature verification failed") from exc
+    except verification.VerificationMisconfigured as exc:
+        logger.error("connector %s is misconfigured: %s", connector_id, exc)
+        raise HTTPException(status_code=500, detail="connector misconfigured") from exc
+
+    try:
+        _WEBHOOK_LIMITER.check(config.org_id)
+    except identity.RateLimitExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # Not JSON (a form post, plain text, XML). Still ingestable - the
+        # extraction layer reads text - so this degrades rather than 400s.
+        payload = {"body": raw_body.decode("utf-8", errors="replace")[:_MAX_TEXT_PAYLOAD_BYTES]}
+    if not isinstance(payload, dict):
+        payload = {"body": payload}
+
+    return await asyncio.to_thread(_handle_webhook, config, payload)
+
+
+def _handle_watcher_sweep(org_id: str, body: dict) -> dict:
     """Blocking work (coordinator.route -> Firestore reads/writes, plus
     a real Gemini call via Diagnosis on any match) - run via
-    asyncio.to_thread, same reasoning as _handle_ingest above."""
-    org_id = body.get("org_id") or os.environ.get("MORTEMTRACE_DEMO_ORG", "org_demo")
+    asyncio.to_thread, same reasoning as _handle_ingest above.
+
+    `org_id` is resolved from the authenticated principal by the route,
+    never read out of `body` - a sweep triggers real model calls, so an
+    unauthenticated caller naming a tenant here was the same cost and
+    cross-tenant problem /ingest had."""
     run_id = new_id("run")
 
     with otel_setup.span("mortemtrace.api", "watcher_sweep", run_id=run_id, org_id=org_id):
@@ -333,48 +548,53 @@ def _handle_watcher_sweep(body: dict) -> dict:
 
 
 @app.post("/watcher/sweep")
-async def watcher_sweep(body: Optional[dict] = Body(default=None)):
+async def watcher_sweep(
+    body: Optional[dict] = Body(default=None),
+    authorization: Optional[str] = Header(None),
+):
     """Cloud Scheduler's target (see infra/schedule.sh) for the periodic
     Watcher sweep (R2, R3). Routed through coordinator.route() exactly
     like every Pub/Sub-originated event - same quarantine check,
     retry/backoff, budget enforcement, and Guardian pre/post-flight - so
     a scheduled trigger isn't a special-cased bypass of any of that.
 
+    Authenticated like /ingest: Cloud Scheduler is configured with an
+    API token (infra/schedule.sh). The tenant comes from that credential;
+    `body.org_id` may only select among tenants it already grants.
+
     Body is optional and JSON: {"org_id": "...", "injected_signal": {...}}.
-    org_id defaults to MORTEMTRACE_DEMO_ORG, matching console/ui.py's
-    convention. injected_signal (a Signal-shaped dict) lets a demo
-    operator force one specific, deterministic correlation live instead
-    of relying on Watcher's mock feed timing (see agents/watcher/
-    watcher.py's module docstring) - this is what makes "inject a
-    provider status degradation" (SPEC section 10, beat 5) an actual
-    button to press rather than a hope that the mock feed cooperates.
+    injected_signal (a Signal-shaped dict) lets a demo operator force one
+    specific, deterministic correlation live instead of relying on
+    Watcher's mock feed timing (see agents/watcher/watcher.py's module
+    docstring) - this is what makes "inject a provider status
+    degradation" (SPEC section 10, beat 5) an actual button to press
+    rather than a hope that the mock feed cooperates.
     """
-    return await asyncio.to_thread(_handle_watcher_sweep, body or {})
+    payload = body or {}
+    resolved_org = _authenticate(authorization, payload.get("org_id"))
+    return await asyncio.to_thread(_handle_watcher_sweep, resolved_org, payload)
 
 
 def _verify_push_token(authorization_header: Optional[str]) -> None:
     """Raises HTTPException(401) unless this is a legitimately
-    Pub/Sub-signed push delivery. The service stays --allow-unauthenticated
-    overall (so /ingest, /watcher/sweep, /healthz work for a public demo -
-    Cloud Run's own IAM invoker check is service-wide, not per-route, so
-    it can't protect this one route without blocking the others too).
-    This route verifies the Google-issued OIDC token itself instead of
-    relying on the platform to reject unauthorized callers before they
-    arrive - the standard documented pattern for a public Cloud Run
-    service with one authenticated Pub/Sub push route."""
-    if authorization_header is None or not authorization_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="missing bearer token")
-    audience = os.environ.get(_PUSH_AUDIENCE_ENV)
-    if not audience:
-        raise HTTPException(status_code=500, detail=f"{_PUSH_AUDIENCE_ENV} not configured")
-    token = authorization_header[len("Bearer "):]
+    Pub/Sub-signed push delivery from *our* pusher service account.
+
+    The service stays --allow-unauthenticated overall (Cloud Run's IAM
+    invoker check is service-wide, not per-route), so this route does its
+    own verification. Delegates to auth.identity.verify_google_oidc,
+    which checks the issuing service-account email and not only the
+    audience: audience alone is not an authorization decision, because
+    any Google principal can mint an ID token with an arbitrary `aud`.
+    """
     try:
-        google.oauth2.id_token.verify_oauth2_token(
-            token, google.auth.transport.requests.Request(), audience=audience,
-        )
-    except Exception as exc:
-        logger.warning("rejected push delivery with invalid token: %s", exc)
-        raise HTTPException(status_code=401, detail="invalid push token") from exc
+        identity.verify_google_oidc(authorization_header)
+    except identity.AuthenticationError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        # Missing server-side configuration - a 500 so it is never
+        # mistaken for "the caller was unauthorized".
+        logger.error("push route is misconfigured: %s", exc)
+        raise HTTPException(status_code=500, detail="push route misconfigured") from exc
 
 
 @app.post("/pubsub/push/{event_type}")
@@ -427,15 +647,29 @@ def _handle_pubsub_push(event_type: str, body: dict) -> dict:
         logger.error("push message for topic=%s missing run_id/org_id: %r", event_type, payload)
         return {"status": "dropped", "reason": "missing run_id/org_id"}
 
+    # These values originate from our own publisher, but they are still
+    # re-validated here: this is the point where an org_id becomes a
+    # Firestore path segment, and "it came from inside the system" is an
+    # assumption worth checking rather than trusting once a message has
+    # round-tripped through a broker.
+    try:
+        identity.validate_org_id(org_id)
+    except identity.InvalidOrgId:
+        logger.error("push message for topic=%s carried an invalid org_id: %r", event_type, org_id)
+        return {"status": "dropped", "reason": "invalid org_id"}
+
     incident_id = payload.get("incident_id") or payload.get("incident_ref")
     claim = _ingest_claim(org_id, run_id)
     envelope = Envelope(
         run_id=run_id, org_id=org_id, incident_id=incident_id, claim=claim,
         event_type=event_type, payload=payload,
     )
+    # Continue the trace the publisher started rather than beginning a new
+    # root span - the other half of end-to-end tracing across Pub/Sub.
+    parent = otel_setup.extract_trace_context(message.get("attributes"))
     with otel_setup.span(
         "mortemtrace.api", "pubsub_push", run_id=run_id, org_id=org_id,
-        incident_id=incident_id, event_type=event_type,
+        incident_id=incident_id, event_type=event_type, context=parent,
     ):
         coordinator.route(event_type, envelope, publish=_publish)
 

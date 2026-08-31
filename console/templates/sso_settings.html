@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}SSO settings — {{ org_id }} — MortemTrace{% endblock %}
+{% block content %}
+<h1>SSO settings</h1>
+<p class="muted mono">{{ org_id }}</p>
+<p class="muted">
+  Configure your organization's own OIDC identity provider (Microsoft Entra ID, Okta, Auth0,
+  or any other OIDC-compliant provider). Employees signing in with an email at the domain below
+  will be routed to this provider automatically instead of Google Sign-In. Leaving this unset is
+  fine — members simply use Google Sign-In instead.
+</p>
+
+<div class="card" style="max-width: 560px;">
+  <form method="post" action="/orgs/{{ org_id }}/sso">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="action" value="save">
+
+    <label for="issuer" class="muted" style="display:block; margin:0.7rem 0 0.3rem;">
+      Issuer URL
+    </label>
+    <input id="issuer" name="issuer" type="url" required
+           value="{{ org.sso.issuer if org.sso else '' }}"
+           placeholder="https://login.microsoftonline.com/&lt;tenant&gt;/v2.0"
+           style="width:100%; padding:0.55rem 0.7rem; background:var(--bg); color:var(--text);
+                  border:1px solid var(--border); border-radius:6px;">
+
+    <label for="client_id" class="muted" style="display:block; margin:0.7rem 0 0.3rem;">
+      Client ID
+    </label>
+    <input id="client_id" name="client_id" type="text" required
+           value="{{ org.sso.client_id if org.sso else '' }}"
+           style="width:100%; padding:0.55rem 0.7rem; background:var(--bg); color:var(--text);
+                  border:1px solid var(--border); border-radius:6px;">
+
+    <label for="client_secret_ref" class="muted" style="display:block; margin:0.7rem 0 0.3rem;">
+      Client secret reference
+    </label>
+    <input id="client_secret_ref" name="client_secret_ref" type="text" required
+           value="{{ org.sso.client_secret_ref if org.sso else '' }}"
+           placeholder="e.g. acme-entra-client-secret"
+           style="width:100%; padding:0.55rem 0.7rem; background:var(--bg); color:var(--text);
+                  border:1px solid var(--border); border-radius:6px;">
+    <p class="muted" style="font-size:0.78rem; margin-top:0.3rem;">
+      A key into MORTEMTRACE_OIDC_CLIENT_SECRETS (Secret Manager-backed) — the actual secret
+      value is never entered here or stored in this document.
+    </p>
+
+    <label for="domain_hint" class="muted" style="display:block; margin:0.7rem 0 0.3rem;">
+      Email domain
+    </label>
+    <input id="domain_hint" name="domain_hint" type="text"
+           value="{{ org.sso.domain_hint if org.sso else '' }}"
+           placeholder="acme.com"
+           style="width:100%; padding:0.55rem 0.7rem; background:var(--bg); color:var(--text);
+                  border:1px solid var(--border); border-radius:6px;">
+
+    <button type="submit"
+            style="margin-top:1rem; padding:0.55rem 1.2rem; background:var(--accent);
+                   color:#04121f; border:0; border-radius:6px; font-weight:700; cursor:pointer;">
+      Save
+    </button>
+  </form>
+
+  {% if org.sso %}
+  <form method="post" action="/orgs/{{ org_id }}/sso" style="margin-top:0.7rem;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="action" value="clear">
+    <button type="submit" class="link-button" style="color: var(--bad);"
+            onclick="return confirm('Remove this SSO configuration? Members will fall back to Google Sign-In.')">
+      Remove SSO configuration
+    </button>
+  </form>
+  {% endif %}
+</div>
+{% endblock %}

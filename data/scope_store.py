@@ -23,18 +23,27 @@ import hashlib
 import hmac
 import logging
 import os
+import secrets
 import threading
-from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Optional
+import time
+from datetime import UTC, datetime, timedelta
+from typing import Any, Callable, Iterable, Optional
 
+from google.api_core.exceptions import AlreadyExists
 from google.cloud import firestore
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 from data.models import (
+    TENANT_SCOPED_COLLECTIONS,
     AuditEntry,
     Collection,
+    Invitation,
+    Membership,
+    Organization,
     OrgClaim,
-    TENANT_SCOPED_COLLECTIONS,
+    User,
     new_id,
+    now,
 )
 from telemetry.otel_setup import record_audit_event
 
@@ -46,8 +55,33 @@ _CLAIM_TTL = timedelta(minutes=15)
 
 _REGISTRY_ROOT = "registry"
 
+# Every Firestore call carries this. Without it a hung backend holds a
+# Cloud Run request until the platform's own 300s ceiling, tying up an
+# instance the whole time; under any concurrency that exhausts the
+# instance pool from a single slow dependency.
+_OP_TIMEOUT_SECONDS = float(os.environ.get("MORTEMTRACE_FIRESTORE_TIMEOUT", "10"))
+
 _CLIENT: Optional[firestore.Client] = None
 _CLIENT_LOCK = threading.Lock()
+
+# Registry scope lookups happen on *every* authorize, i.e. every read and
+# every write. The registry is near-static (it changes only when someone
+# publishes an agent version), so re-fetching it per operation was pure
+# overhead: it made a single logical read cost two reads plus an audit
+# write. Cached with a short TTL so a publish still takes effect without
+# a redeploy - R4's "no redeploy" property is preserved, just with up to
+# _SCOPE_CACHE_TTL of delay instead of zero.
+_SCOPE_CACHE_TTL = float(os.environ.get("MORTEMTRACE_SCOPE_CACHE_TTL", "30"))
+_SCOPE_CACHE: dict[tuple[str, str], tuple[float, tuple[list, list]]] = {}
+_SCOPE_CACHE_LOCK = threading.Lock()
+
+
+def clear_scope_cache() -> None:
+    """Invalidates the scope cache. Called after a registry write so a
+    publish is visible immediately in the process that made it, and used
+    by tests to keep cases independent."""
+    with _SCOPE_CACHE_LOCK:
+        _SCOPE_CACHE.clear()
 
 
 class ScopeDenied(Exception):
@@ -119,7 +153,7 @@ def sign_claim(org_id: str, agent_name: str, agent_version: str, run_id: str) ->
     claim fields is the trust boundary for this deployment; a multi-signer
     production system would move this to Secret Manager-backed per-service-
     account keys (see ARCHITECTURE.md section 9)."""
-    issued_at = datetime.now(timezone.utc)
+    issued_at = datetime.now(UTC)
     expires_at = issued_at + _CLAIM_TTL
     sig = hmac.new(
         _secret(),
@@ -133,7 +167,7 @@ def sign_claim(org_id: str, agent_name: str, agent_version: str, run_id: str) ->
 
 
 def verify_claim(claim: OrgClaim) -> bool:
-    if datetime.now(timezone.utc) > claim.expires_at:
+    if datetime.now(UTC) > claim.expires_at:
         return False
     expected = hmac.new(
         _secret(),
@@ -160,26 +194,73 @@ def _resolve_scopes(agent_name: str, agent_version: str) -> tuple[list[Collectio
     Deliberately does not trust a caller-supplied scope list: the data
     layer decides what an agent may touch by looking it up itself, never
     by asking the agent what it thinks it's allowed to do.
+
+    Cached for _SCOPE_CACHE_TTL seconds - see the cache declaration above
+    for why, and for why a short TTL rather than permanent memoisation.
+    An unknown agent's empty result is cached too: that is the deny path,
+    and leaving it uncached would let an unregistered agent hammer the
+    registry on every attempt.
     """
+    key = (agent_name, agent_version)
+    nowt = time.monotonic()
+    with _SCOPE_CACHE_LOCK:
+        entry = _SCOPE_CACHE.get(key)
+        if entry is not None and entry[0] > nowt:
+            return entry[1]
+
     doc = (
         _client()
         .collection(_REGISTRY_ROOT)
         .document(agent_name)
         .collection("versions")
         .document(agent_version)
-        .get()
+        .get(timeout=_OP_TIMEOUT_SECONDS)
     )
     if not doc.exists:
-        return [], []
-    data = doc.to_dict() or {}
-    reads = [Collection(c) for c in data.get("read_scopes", [])]
-    writes = [Collection(c) for c in data.get("write_scopes", [])]
-    return reads, writes
+        resolved: tuple[list, list] = ([], [])
+    else:
+        data = doc.to_dict() or {}
+        # An unrecognised collection name in a registry entry must deny,
+        # not explode: a typo (or an entry written by a newer version of
+        # the code) would otherwise raise ValueError out of the authorize
+        # path and surface as a 500 rather than a clean denial.
+        resolved = (
+            _coerce_collections(data.get("read_scopes", []), agent_name, "read"),
+            _coerce_collections(data.get("write_scopes", []), agent_name, "write"),
+        )
+
+    with _SCOPE_CACHE_LOCK:
+        _SCOPE_CACHE[key] = (nowt + _SCOPE_CACHE_TTL, resolved)
+    return resolved
+
+
+def _coerce_collections(raw: Iterable[Any], agent_name: str, mode: str) -> list[Collection]:
+    out: list[Collection] = []
+    for value in raw or []:
+        try:
+            out.append(Collection(value))
+        except ValueError:
+            logger.error(
+                "registry entry for %s declares unknown %s scope %r; ignoring it "
+                "(the grant is dropped, so this fails closed)", agent_name, mode, value,
+            )
+    return out
 
 
 # --------------------------------------------------------------------------
 # Audit
 # --------------------------------------------------------------------------
+
+# Audit entries are written on every allow and every deny, so the
+# collection grows roughly three documents per agent operation and, left
+# alone, forever. Firestore's TTL policy deletes them server-side once
+# `expires_at` passes - see infra/firestore.indexes.json and
+# infra/README.md for the one-time enablement command.
+#
+# The retention default is deliberately long: this is a compliance audit
+# trail, and shortening it is a policy decision, not a performance one.
+_AUDIT_RETENTION_DAYS = int(os.environ.get("MORTEMTRACE_AUDIT_RETENTION_DAYS", "400"))
+
 
 def _audit(org_id: str, actor_agent: str, version: str, verdict: str,
            reason: str, path: str, run_id: str) -> None:
@@ -187,9 +268,14 @@ def _audit(org_id: str, actor_agent: str, version: str, verdict: str,
         entry_id=new_id("audit"), org_id=org_id, actor_agent=actor_agent,
         version=version, verdict=verdict, reason=reason, path=path, run_id=run_id,
     )
+    document = entry.model_dump(mode="json")
+    # Written as a native datetime, not the ISO string model_dump produces:
+    # Firestore's TTL only acts on a real Timestamp field, so serialising
+    # this one to a string would leave the policy silently inert.
+    document["expires_at"] = datetime.now(UTC) + timedelta(days=_AUDIT_RETENTION_DAYS)
     _client().collection("tenants").document(org_id).collection("audit").document(
         entry.entry_id
-    ).set(entry.model_dump(mode="json"))
+    ).set(document)
     # Firestore /audit is the permanent structured record; this mirrors the
     # same event onto whatever OTel span is active so R10's "scope denial
     # visible in the same trace as the commit it affected" holds without
@@ -254,10 +340,10 @@ def read(
 
     ref = _collection_ref(target_org, collection)
     if doc_id is not None:
-        snap = ref.document(doc_id).get()
+        snap = ref.document(doc_id).get(timeout=_OP_TIMEOUT_SECONDS)
         result = snap.to_dict() if snap.exists else None
     else:
-        result = [d.to_dict() for d in ref.stream()]
+        result = [d.to_dict() for d in ref.stream(timeout=_OP_TIMEOUT_SECONDS)]
 
     _audit(claim.org_id, claim.agent_name, claim.agent_version, "allow",
            "read granted", f"{collection.value}/{doc_id or '*'}", claim.run_id)
@@ -281,6 +367,35 @@ def try_read(
         return None
 
 
+_DEMO_PROOFS_ENV = "MORTEMTRACE_DEMO_SCOPE_PROOFS"
+
+
+def demo_scope_proof(claim: OrgClaim, collection: Collection, doc_id: str) -> None:
+    """Performs a read that is *expected* to be denied, to produce a
+    visible denial in the audit trail.
+
+    Comms, Compliance and Exposure each did this inline to generate the
+    on-camera scope-denial proof (SPEC section 10, beat 2). It is a good
+    demo device and a bad production default: it costs a registry lookup
+    plus an audit write on every single agent run, and it fills the audit
+    log with self-inflicted denials that a real security reviewer has to
+    triage as noise before finding a genuine one.
+
+    Off unless MORTEMTRACE_DEMO_SCOPE_PROOFS=1. The boundary itself is
+    unchanged either way - it is enforced by _authorize() whether or not
+    anyone deliberately walks into it.
+    """
+    if os.environ.get(_DEMO_PROOFS_ENV) != "1":
+        return
+    result = try_read(claim, collection, doc_id)
+    if result is not None:
+        logger.warning(
+            "%s unexpectedly read %s for %s - scope misconfiguration? "
+            "ignoring the content regardless.",
+            claim.agent_name, collection.value, doc_id,
+        )
+
+
 def query(
     claim: OrgClaim,
     collection: Collection,
@@ -288,17 +403,32 @@ def query(
     *,
     path_org_id: Optional[str] = None,
     limit: Optional[int] = None,
+    order_by: Optional[str] = None,
+    descending: bool = False,
 ) -> list[dict]:
-    """Filtered read. Same scope/tenant enforcement as read()."""
+    """Filtered read. Same scope/tenant enforcement as read().
+
+    `order_by`/`descending` exist so callers can get "the most recent N"
+    from the server rather than fetching an entire collection and sorting
+    in Python. The console did the latter for runs and for the audit log -
+    audit grows by roughly three entries per agent operation, so that page
+    got monotonically slower forever and would eventually time out.
+    """
     target_org = path_org_id or claim.org_id
     _authorize(claim, collection, "read", target_org)
 
     q = _collection_ref(target_org, collection)
     for field, op, value in filters:
-        q = q.where(field, op, value)
+        # Keyword FieldFilter, not the positional where(field, op, value)
+        # form: the positional signature is deprecated and emitted a
+        # UserWarning on every query, which showed up in production logs
+        # as recurring noise around every genuine log line.
+        q = q.where(filter=FieldFilter(field, op, value))
+    if order_by:
+        q = q.order_by(order_by, direction="DESCENDING" if descending else "ASCENDING")
     if limit:
         q = q.limit(limit)
-    docs = [d.to_dict() for d in q.stream()]
+    docs = [d.to_dict() for d in q.stream(timeout=_OP_TIMEOUT_SECONDS)]
 
     _audit(claim.org_id, claim.agent_name, claim.agent_version, "allow",
            f"query granted ({len(docs)} docs)", collection.value, claim.run_id)
@@ -312,10 +442,13 @@ def try_query(
     *,
     path_org_id: Optional[str] = None,
     limit: Optional[int] = None,
+    order_by: Optional[str] = None,
+    descending: bool = False,
 ) -> list[dict]:
     """query(), degraded to an empty list on ScopeDenied instead of raising."""
     try:
-        return query(claim, collection, filters, path_org_id=path_org_id, limit=limit)
+        return query(claim, collection, filters, path_org_id=path_org_id, limit=limit,
+                     order_by=order_by, descending=descending)
     except ScopeDenied as exc:
         logger.info("degraded query: %s", exc)
         return []
@@ -348,17 +481,89 @@ def write(
             _client().collection("tenants").document(target_org)
             .collection("_idempotency").document(idempotency_key)
         )
-        if marker_ref.get().exists:
+        # create() fails if the document already exists, atomically, in a
+        # single round trip. The previous get()-then-set() was a
+        # check-then-act race: two concurrent deliveries of the same
+        # Pub/Sub message (at-least-once is the guarantee, so this is
+        # expected, not exotic) could both observe "not present" and both
+        # proceed - defeating the exact duplicate-suppression this key
+        # exists to provide.
+        try:
+            marker_ref.create(
+                {"run_id": claim.run_id, "at": firestore.SERVER_TIMESTAMP},
+                timeout=_OP_TIMEOUT_SECONDS,
+            )
+        except AlreadyExists:
             _audit(claim.org_id, claim.agent_name, claim.agent_version, "allow",
                    "duplicate write skipped (idempotent)",
                    f"{collection.value}/{doc_id}", claim.run_id)
             return False
-        marker_ref.set({"run_id": claim.run_id, "at": firestore.SERVER_TIMESTAMP})
 
-    _collection_ref(target_org, collection).document(doc_id).set(data)
+    _collection_ref(target_org, collection).document(doc_id).set(data, timeout=_OP_TIMEOUT_SECONDS)
     _audit(claim.org_id, claim.agent_name, claim.agent_version, "allow",
            "write granted", f"{collection.value}/{doc_id}", claim.run_id)
     return True
+
+
+def update_in_transaction(
+    claim: OrgClaim,
+    collection: Collection,
+    doc_id: str,
+    mutate: Callable[[Optional[dict]], dict],
+    *,
+    path_org_id: Optional[str] = None,
+) -> dict:
+    """Read-modify-write a single document atomically.
+
+    `mutate` receives the current document (or None) and returns the
+    document to store. It may be called more than once: Firestore retries
+    the transaction on contention, so `mutate` must be a pure function of
+    its argument and must not have side effects.
+
+    This exists because the plain read()/write() pair is a lost-update
+    race whenever two writers touch the same document concurrently, which
+    is routine here - Pub/Sub delivers concurrently and Cloud Run runs
+    many instances. agents/ledger/ledger.py appending to a single
+    timeline document was the case that mattered: two evidence items for
+    one incident could each read the same timeline, each append their own
+    entry, and the second write would silently discard the first. No
+    error, no log - just a missing entry in the artifact the whole
+    product is built around.
+    """
+    target_org = path_org_id or claim.org_id
+    # BOTH scopes, not just write. `mutate` is handed the current document,
+    # so authorizing only the write would have turned this into a way for
+    # an agent with write-but-not-read scope to see content it is denied -
+    # a read-modify-write genuinely requires both, and checking only one
+    # would have quietly weakened the boundary this module exists to hold.
+    _authorize(claim, collection, "read", target_org)
+    _authorize(claim, collection, "write", target_org)
+
+    doc_ref = _collection_ref(target_org, collection).document(doc_id)
+    client = _client()
+
+    def _body(transaction):
+        snapshot = doc_ref.get(transaction=transaction)
+        current = snapshot.to_dict() if snapshot.exists else None
+        updated = mutate(current)
+        if collection in (Collection.TIMELINE, Collection.HYPOTHESES):
+            _require_source_event_ids(collection, updated)
+        transaction.set(doc_ref, updated)
+        return updated
+
+    # The in-memory test double implements run_transaction() with real
+    # serialisation, so the concurrency behaviour this function exists for
+    # is exercised by the unit suite rather than only in production
+    # against the real backend.
+    run_transaction = getattr(client, "run_transaction", None)
+    if run_transaction is not None:
+        result = run_transaction(_body)
+    else:
+        result = firestore.transactional(_body)(client.transaction())
+
+    _audit(claim.org_id, claim.agent_name, claim.agent_version, "allow",
+           "transactional write granted", f"{collection.value}/{doc_id}", claim.run_id)
+    return result
 
 
 def _require_source_event_ids(collection: Collection, data: dict) -> None:
@@ -408,14 +613,133 @@ def registry_list_versions(claim: OrgClaim, agent_name: str) -> list[dict]:
     return result
 
 
+_PLATFORM_ORG_ENV = "MORTEMTRACE_PLATFORM_ORG"
+
+
+def _platform_org() -> Optional[str]:
+    return os.environ.get(_PLATFORM_ORG_ENV)
+
+
 def registry_put(claim: OrgClaim, agent_name: str, version: str, data: dict) -> None:
+    """Publishes an agent version.
+
+    `/registry` is deliberately global rather than tenant-scoped - agent
+    definitions are platform infrastructure, shared by every tenant. That
+    is the right model, but it made registry writes a cross-tenant
+    privilege escalation path: _authorize() skips the tenant check for
+    REGISTRY (correctly, since there is no tenant in the path), so *any*
+    tenant's identity holding REGISTRY write scope could rewrite the
+    scope grants governing every other tenant - for example granting
+    `comms` read access to raw_evidence globally.
+
+    When MORTEMTRACE_PLATFORM_ORG is configured, writes are restricted to
+    that org. Left unset it stays permissive, which preserves existing
+    single-tenant behaviour, and warns so the gap is visible.
+    """
+    platform_org = _platform_org()
+    if platform_org is not None and claim.org_id != platform_org:
+        _audit(claim.org_id, claim.agent_name, claim.agent_version, "deny",
+               f"registry write refused: {claim.org_id} is not the platform org",
+               f"registry/{agent_name}/versions/{version}", claim.run_id)
+        raise TenantViolation(
+            f"registry writes are restricted to the platform org; {claim.org_id} is not it"
+        )
+    if platform_org is None:
+        logger.warning(
+            "%s is not set: any tenant holding registry write scope can modify agent "
+            "definitions for every tenant. Set it to close this.", _PLATFORM_ORG_ENV,
+        )
+
     _authorize(claim, Collection.REGISTRY, "write", claim.org_id)
     (
         _client().collection(_REGISTRY_ROOT).document(agent_name)
-        .collection("versions").document(version).set(data)
+        .collection("versions").document(version)
+        .set(data, timeout=_OP_TIMEOUT_SECONDS)
     )
+    # Publishing must take effect immediately in the publishing process
+    # rather than after the cache TTL - R4's "publish with no redeploy"
+    # should not read as "publish, then wait".
+    clear_scope_cache()
     _audit(claim.org_id, claim.agent_name, claim.agent_version, "allow",
            "registry write granted", f"registry/{agent_name}/versions/{version}", claim.run_id)
+
+
+# --------------------------------------------------------------------------
+# Connectors
+#
+# Stored in a GLOBAL /connectors collection rather than under
+# /tenants/{org}/..., for the same reason the registry is global: the only
+# lookup that matters happens before the tenant is known. A webhook
+# arrives carrying a connector_id in its URL and a vendor signature - not
+# one of our API tokens - so the document that says which tenant it
+# belongs to has to be findable without already knowing the tenant.
+#
+# Because the path is not tenant-scoped, _authorize()'s automatic tenant
+# check does not apply, so the org check is made explicitly below. Getting
+# this wrong would let one tenant register a connector into another's
+# namespace.
+# --------------------------------------------------------------------------
+
+_CONNECTOR_ROOT = "connectors"
+
+
+def find_connector(connector_id: str, org_hint: Optional[str] = None) -> Optional[dict]:
+    """Unauthenticated read of one connector document.
+
+    Deliberately unauthenticated - see the section comment above for the
+    chicken-and-egg that forces it. This read establishes only *which*
+    signature to verify; connectors/verification.py is what actually
+    authorises the request, and the connector_id is unguessable.
+    """
+    doc = (
+        _client().collection(_CONNECTOR_ROOT).document(connector_id)
+        .get(timeout=_OP_TIMEOUT_SECONDS)
+    )
+    if not doc.exists:
+        return None
+    data = doc.to_dict() or {}
+    if org_hint is not None and data.get("org_id") != org_hint:
+        return None
+    return data
+
+
+def connector_put(claim: OrgClaim, connector_id: str, data: dict) -> None:
+    """Registers or updates a connector. Scope-enforced, plus an explicit
+    tenant check the global path would otherwise skip."""
+    _authorize(claim, Collection.CONNECTORS, "write", claim.org_id)
+    if data.get("org_id") != claim.org_id:
+        _audit(claim.org_id, claim.agent_name, claim.agent_version, "deny",
+               f"connector write refused: document org {data.get('org_id')!r} "
+               f"does not match claim org {claim.org_id!r}",
+               f"connectors/{connector_id}", claim.run_id)
+        raise TenantViolation("connector org_id does not match the claim")
+
+    (
+        _client().collection(_CONNECTOR_ROOT).document(connector_id)
+        .set(data, timeout=_OP_TIMEOUT_SECONDS)
+    )
+    _audit(claim.org_id, claim.agent_name, claim.agent_version, "allow",
+           "connector write granted", f"connectors/{connector_id}", claim.run_id)
+
+
+def connector_list(claim: OrgClaim) -> list[dict]:
+    """Every connector belonging to the claim's tenant."""
+    _authorize(claim, Collection.CONNECTORS, "read", claim.org_id)
+    docs = (
+        _client().collection(_CONNECTOR_ROOT)
+        .where(filter=FieldFilter("org_id", "==", claim.org_id))
+        .stream(timeout=_OP_TIMEOUT_SECONDS)
+    )
+    result = [d.to_dict() for d in docs]
+    _audit(claim.org_id, claim.agent_name, claim.agent_version, "allow",
+           f"connector list granted ({len(result)})", "connectors/*", claim.run_id)
+    return result
+
+
+def bootstrap_connector_write(connector_id: str, data: dict) -> None:
+    """Unauthenticated connector registration, for infra scripts only -
+    same rule and same reasoning as bootstrap_write below."""
+    _client().collection(_CONNECTOR_ROOT).document(connector_id).set(data)
 
 
 # --------------------------------------------------------------------------
@@ -440,3 +764,374 @@ def bootstrap_registry_write(agent_name: str, version: str, data: dict) -> None:
         _client().collection(_REGISTRY_ROOT).document(agent_name)
         .collection("versions").document(version).set(data)
     )
+
+
+# --------------------------------------------------------------------------
+# Human identity / organizations / memberships / invitations
+#
+# A separate trust model from the OrgClaim system above. OrgClaim answers
+# "may this AGENT touch this TENANT's incident data"; the functions below
+# answer "which org(s) does this AUTHENTICATED HUMAN belong to, and what
+# may they administer there" - a question the agent-scope system has no
+# concept of at all.
+#
+# No OrgClaim is threaded through these functions, and none can be: a
+# brand-new user creating their first organization has no tenant
+# membership yet to mint one from. This is the same structural
+# chicken-and-egg /registry and /connectors already solve by living in
+# their own global collections with authorization enforced explicitly in
+# each function, rather than relying on _authorize()'s automatic tenant
+# match. Every caller here has already had its identity verified by
+# auth/ (a signature-checked OIDC ID token) before scope_store is ever
+# reached; nothing here trusts a client-supplied value on its own -
+# `acting_user_id` on a mutating call is re-checked against a live
+# Membership row inside the function, never assumed from the caller.
+# --------------------------------------------------------------------------
+
+_ORGANIZATIONS_ROOT = "organizations"
+_USERS_ROOT = "users"
+_MEMBERSHIPS_ROOT = "memberships"
+_INVITATIONS_ROOT = "invitations"
+
+_INVITATION_TTL = timedelta(days=14)
+
+
+class PermissionDenied(Exception):
+    """The acting user is authenticated but lacks the role required for
+    this action (e.g. a member trying to invite someone). HTTP 403."""
+
+
+def _membership_id(user_id: str, org_id: str) -> str:
+    return f"{user_id}__{org_id}"
+
+
+def get_organization(org_id: str) -> Optional[dict]:
+    doc = _client().collection(_ORGANIZATIONS_ROOT).document(org_id).get(timeout=_OP_TIMEOUT_SECONDS)
+    return doc.to_dict() if doc.exists else None
+
+
+def create_organization(display_name: str, created_by_user_id: str) -> dict:
+    """Creates a brand-new organization with `created_by_user_id` as its
+    founding admin. Atomic: the org document and the admin membership are
+    the same transaction, so a crash between the two can never leave an
+    organization with zero members able to administer it."""
+    org_id = new_id("org")
+    org = Organization(org_id=org_id, display_name=display_name, created_by=created_by_user_id)
+    membership = Membership(
+        membership_id=_membership_id(created_by_user_id, org_id),
+        user_id=created_by_user_id, org_id=org_id, role="admin",
+    )
+
+    client = _client()
+
+    def _body(transaction):
+        transaction.set(
+            client.collection(_ORGANIZATIONS_ROOT).document(org_id),
+            org.model_dump(mode="json"),
+        )
+        transaction.set(
+            client.collection(_MEMBERSHIPS_ROOT).document(membership.membership_id),
+            membership.model_dump(mode="json"),
+        )
+
+    run_transaction = getattr(client, "run_transaction", None)
+    if run_transaction is not None:
+        run_transaction(_body)
+    else:
+        firestore.transactional(_body)(client.transaction())
+
+    logger.info("organization %s (%r) created by %s", org_id, display_name, created_by_user_id)
+    return org.model_dump(mode="json")
+
+
+def get_user(user_id: str) -> Optional[dict]:
+    doc = _client().collection(_USERS_ROOT).document(user_id).get(timeout=_OP_TIMEOUT_SECONDS)
+    return doc.to_dict() if doc.exists else None
+
+
+def upsert_user(user_id: str, *, email: str, display_name: str) -> dict:
+    """Creates or refreshes a user's profile. Called after every
+    successful OIDC login - `last_login_at` is what an admin's member
+    list shows to distinguish an active teammate from one who was invited
+    and never signed in."""
+    existing = get_user(user_id)
+    user = User(
+        user_id=user_id, email=email, display_name=display_name,
+        created_at=existing["created_at"] if existing else now(),
+        last_login_at=now(),
+    )
+    document = user.model_dump(mode="json")
+    _client().collection(_USERS_ROOT).document(user_id).set(document, timeout=_OP_TIMEOUT_SECONDS)
+    return document
+
+
+def get_membership(user_id: str, org_id: str) -> Optional[dict]:
+    doc = (
+        _client().collection(_MEMBERSHIPS_ROOT).document(_membership_id(user_id, org_id))
+        .get(timeout=_OP_TIMEOUT_SECONDS)
+    )
+    data = doc.to_dict() if doc.exists else None
+    return data if data and data.get("status") == "active" else None
+
+
+def list_memberships_for_user(user_id: str) -> list[dict]:
+    """Every org this user may act as - what the login/org-switcher flow
+    resolves a session down to. Excludes revoked rows: deprovisioning
+    takes effect on this user's very next request, since nothing caches
+    membership across requests the way the (much more static) agent
+    registry scope cache does."""
+    docs = (
+        _client().collection(_MEMBERSHIPS_ROOT)
+        .where(filter=FieldFilter("user_id", "==", user_id))
+        .where(filter=FieldFilter("status", "==", "active"))
+        .stream(timeout=_OP_TIMEOUT_SECONDS)
+    )
+    return [d.to_dict() for d in docs]
+
+
+def list_memberships_for_org(org_id: str) -> list[dict]:
+    """An admin's "members" view. Includes revoked rows so the page can
+    show who used to have access, not just who currently does."""
+    docs = (
+        _client().collection(_MEMBERSHIPS_ROOT)
+        .where(filter=FieldFilter("org_id", "==", org_id))
+        .stream(timeout=_OP_TIMEOUT_SECONDS)
+    )
+    return [d.to_dict() for d in docs]
+
+
+def _require_admin(acting_user_id: str, org_id: str) -> None:
+    membership = get_membership(acting_user_id, org_id)
+    if membership is None or membership.get("role") != "admin":
+        raise PermissionDenied(f"{acting_user_id} is not an admin of {org_id}")
+
+
+class LastAdminError(Exception):
+    """Refused: this would leave org_id with zero active admins. Not a
+    security check - a lockout guard. Nobody gains unauthorized access
+    by this being refused; the org would simply become unadministerable
+    by anyone, including whoever just tried."""
+
+
+def _count_active_admins(org_id: str) -> int:
+    return sum(
+        1 for m in list_memberships_for_org(org_id)
+        if m.get("status") == "active" and m.get("role") == "admin"
+    )
+
+
+def create_membership(user_id: str, org_id: str, role: str, *, invited_by: Optional[str] = None) -> dict:
+    """Grants org_id/role to user_id directly - used for domain-based and
+    demo auto-join, where the "invitation" is the organization's own
+    configuration rather than a per-person Invitation record. Idempotent:
+    re-running (e.g. the same person logging in twice before any explicit
+    revoke) overwrites with the same values rather than erroring."""
+    membership = Membership(
+        membership_id=_membership_id(user_id, org_id),
+        user_id=user_id, org_id=org_id, role=role, invited_by=invited_by,
+    )
+    document = membership.model_dump(mode="json")
+    _client().collection(_MEMBERSHIPS_ROOT).document(membership.membership_id).set(
+        document, timeout=_OP_TIMEOUT_SECONDS,
+    )
+    return document
+
+
+def update_membership_role(acting_user_id: str, org_id: str, target_user_id: str, role: str) -> dict:
+    """Admin-only. Re-checks the acting user's role against a live
+    Membership row rather than trusting the caller's session claims -
+    the same "the data layer decides, never the caller" rule
+    _resolve_scopes already applies to agent scopes.
+
+    Refuses (LastAdminError) a demotion that would leave zero active
+    admins - not a security boundary, a lockout guard: past this point
+    nobody, including the person who just did it, could administer the
+    org at all."""
+    _require_admin(acting_user_id, org_id)
+    membership_id = _membership_id(target_user_id, org_id)
+    doc_ref = _client().collection(_MEMBERSHIPS_ROOT).document(membership_id)
+    snap = doc_ref.get(timeout=_OP_TIMEOUT_SECONDS)
+    if not snap.exists:
+        raise ValueError(f"no such membership: {target_user_id} in {org_id}")
+    data = snap.to_dict()
+    if data.get("role") == "admin" and role != "admin" and _count_active_admins(org_id) <= 1:
+        raise LastAdminError(f"{org_id} would have zero admins left")
+    data["role"] = role
+    doc_ref.set(data, timeout=_OP_TIMEOUT_SECONDS)
+    return data
+
+
+def revoke_membership(acting_user_id: str, org_id: str, target_user_id: str) -> None:
+    """Admin-only. Sets status=revoked rather than deleting: the record
+    of who used to have access, and who removed them, is itself an
+    audit-relevant fact. Same last-admin guard as update_membership_role."""
+    _require_admin(acting_user_id, org_id)
+    membership_id = _membership_id(target_user_id, org_id)
+    doc_ref = _client().collection(_MEMBERSHIPS_ROOT).document(membership_id)
+    snap = doc_ref.get(timeout=_OP_TIMEOUT_SECONDS)
+    if not snap.exists:
+        raise ValueError(f"no such membership: {target_user_id} in {org_id}")
+    data = snap.to_dict()
+    if data.get("role") == "admin" and data.get("status") == "active" and _count_active_admins(org_id) <= 1:
+        raise LastAdminError(f"{org_id} would have zero admins left")
+    data["status"] = "revoked"
+    doc_ref.set(data, timeout=_OP_TIMEOUT_SECONDS)
+
+
+def create_invitation(acting_user_id: str, org_id: str, email: str, role: str) -> tuple[dict, str]:
+    """Admin-only. Returns (invitation document, raw token) - the raw
+    token is shown exactly once by the caller and only its digest is
+    persisted, the same pattern infra/mint_token.py uses for API tokens.
+    There is no email-sending integration in this deployment, so the
+    admin shares the resulting link manually (Slack, email client) rather
+    than one being sent server-side."""
+    _require_admin(acting_user_id, org_id)
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    invitation = Invitation(
+        invitation_id=new_id("inv"), org_id=org_id, email=email.strip().lower(),
+        role=role, invited_by=acting_user_id, token_hash=token_hash,
+        expires_at=now() + _INVITATION_TTL,
+    )
+    document = invitation.model_dump(mode="json")
+    _client().collection(_INVITATIONS_ROOT).document(invitation.invitation_id).set(
+        document, timeout=_OP_TIMEOUT_SECONDS,
+    )
+    return document, token
+
+
+def find_invitation_by_token(token: str) -> Optional[dict]:
+    """Constant-time-ish lookup over pending invitations, mirroring
+    auth/identity.py's API-token lookup: compares every candidate with
+    compare_digest rather than a plain dict-get on the digest, so the
+    match itself is not a timing oracle. Invitations are created rarely
+    enough that scanning all pending ones costs nothing meaningful."""
+    presented = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    docs = (
+        _client().collection(_INVITATIONS_ROOT)
+        .where(filter=FieldFilter("status", "==", "pending"))
+        .stream(timeout=_OP_TIMEOUT_SECONDS)
+    )
+    for doc in docs:
+        data = doc.to_dict()
+        if hmac.compare_digest(str(data.get("token_hash", "")), presented):
+            expires_at = data.get("expires_at")
+            if isinstance(expires_at, str):
+                expires_at = datetime.fromisoformat(expires_at)
+            if expires_at is not None and expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            if expires_at is not None and now() > expires_at:
+                return None
+            return data
+    return None
+
+
+def redeem_invitation(invitation_id: str, redeeming_user_id: str) -> dict:
+    """Atomically marks one invitation redeemed and creates the
+    membership it grants. Transactional so two near-simultaneous redeem
+    attempts (a double click, or two tabs) cannot both succeed - the
+    second observes status != "pending" inside the same transaction and
+    is rejected rather than silently creating a duplicate membership."""
+    client = _client()
+    invitation_ref = client.collection(_INVITATIONS_ROOT).document(invitation_id)
+
+    def _body(transaction):
+        snap = invitation_ref.get(transaction=transaction)
+        if not snap.exists:
+            raise ValueError("no such invitation")
+        data = snap.to_dict()
+        if data.get("status") != "pending":
+            raise ValueError(f"invitation is {data.get('status')}, not pending")
+
+        membership = Membership(
+            membership_id=_membership_id(redeeming_user_id, data["org_id"]),
+            user_id=redeeming_user_id, org_id=data["org_id"],
+            role=data["role"], invited_by=data["invited_by"],
+        )
+        transaction.set(
+            client.collection(_MEMBERSHIPS_ROOT).document(membership.membership_id),
+            membership.model_dump(mode="json"),
+        )
+        data["status"] = "redeemed"
+        transaction.set(invitation_ref, data)
+        return membership.model_dump(mode="json")
+
+    run_transaction = getattr(client, "run_transaction", None)
+    if run_transaction is not None:
+        return run_transaction(_body)
+    return firestore.transactional(_body)(client.transaction())
+
+
+def set_organization_sso(acting_user_id: str, org_id: str, sso: Optional[dict]) -> dict:
+    """Admin-only. `sso=None` clears the org's SSO configuration, falling
+    every member back to the Google sign-in path."""
+    _require_admin(acting_user_id, org_id)
+    org_ref = _client().collection(_ORGANIZATIONS_ROOT).document(org_id)
+    snap = org_ref.get(timeout=_OP_TIMEOUT_SECONDS)
+    if not snap.exists:
+        raise ValueError(f"no such organization: {org_id}")
+    data = snap.to_dict()
+    data["sso"] = sso
+    org_ref.set(data, timeout=_OP_TIMEOUT_SECONDS)
+    return data
+
+
+def find_organization_by_domain(email_domain: str) -> Optional[dict]:
+    """Home Realm Discovery: which org (if any) has `email_domain` in its
+    verified auto-join list. Used both to route a login to that org's own
+    IdP (when sso.domain_hint matches) and, after any successful login,
+    to auto-join a first-time user whose email domain matches.
+
+    A full collection scan, not a query: Firestore has no
+    array-contains-with-arbitrary-string-match, and `auto_join_domains`
+    lists are short and organizations are not high-cardinality at this
+    scale. Revisit with a denormalized `domain -> org_id` lookup
+    collection if that stops being true.
+    """
+    domain = email_domain.strip().lower()
+    for doc in _client().collection(_ORGANIZATIONS_ROOT).stream(timeout=_OP_TIMEOUT_SECONDS):
+        data = doc.to_dict() or {}
+        if domain in [d.lower() for d in data.get("auto_join_domains", [])]:
+            return data
+    return None
+
+
+def find_organization_by_sso_domain_hint(email_domain: str) -> Optional[dict]:
+    """Home Realm Discovery's OTHER half: which org's *own IdP* an email
+    domain should be routed to, distinct from find_organization_by_domain
+    above. The two are deliberately separate fields, not one: an org can
+    set auto_join_domains with no sso configured at all (its employees
+    just use the Google fallback, and still auto-join as members), so
+    "should this email auto-join" and "which non-Google IdP should this
+    email be redirected to" are genuinely different questions that happen
+    to often (not always) share the same domain string.
+    """
+    domain = email_domain.strip().lower()
+    for doc in _client().collection(_ORGANIZATIONS_ROOT).stream(timeout=_OP_TIMEOUT_SECONDS):
+        data = doc.to_dict() or {}
+        sso = data.get("sso") or {}
+        if sso.get("domain_hint", "").lower() == domain:
+            return data
+    return None
+
+
+def find_public_demo_organization() -> Optional[dict]:
+    """The one organization (if any) flagged public_demo_auto_join. Used
+    only by the explicit "view live demo" entry point - never consulted
+    during an ordinary login, so an org configuring this can never be
+    stumbled into by accident."""
+    docs = (
+        _client().collection(_ORGANIZATIONS_ROOT)
+        .where(filter=FieldFilter("public_demo_auto_join", "==", True))
+        .limit(1)
+        .stream(timeout=_OP_TIMEOUT_SECONDS)
+    )
+    for doc in docs:
+        return doc.to_dict()
+    return None
+
+
+def bootstrap_organization_write(org_id: str, data: dict) -> None:
+    """Unauthenticated write for seeding the demo organization itself.
+    infra/seed_data.py only, same rule as bootstrap_write."""
+    _client().collection(_ORGANIZATIONS_ROOT).document(org_id).set(data)

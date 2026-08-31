@@ -46,16 +46,12 @@ def run(claim: OrgClaim, envelope: Envelope) -> RunResult:
         return RunResult(status="dead_letter", detail="envelope carried no incident_id")
 
     # Exposure's registry scope is windows + customer terms only - it
-    # never gets Timeline. This call proves that boundary is real rather
-    # than only documented: it is always denied at the store layer, and
-    # the denial lands in /audit for the same on-camera proof as Comms
-    # and Compliance (SPEC section 10, beat 2).
-    timeline_detail = scope_store.try_read(claim, Collection.TIMELINE, incident_id)
-    if timeline_detail is not None:
-        logger.warning(
-            "exposure unexpectedly read timeline for incident %s - scope "
-            "misconfiguration? ignoring the content regardless.", incident_id,
-        )
+    # never gets Timeline. Demo-only: deliberately walk into that boundary
+    # so the denial is visible in /audit (SPEC section 10, beat 2). Gated
+    # behind MORTEMTRACE_DEMO_SCOPE_PROOFS so production does not pay a
+    # registry lookup plus an audit write per run for a proof nobody is
+    # watching. The boundary holds either way.
+    scope_store.demo_scope_proof(claim, Collection.TIMELINE, incident_id)
 
     classification = scope_store.read(claim, Collection.CLASSIFICATION, incident_id)
     if not classification:
