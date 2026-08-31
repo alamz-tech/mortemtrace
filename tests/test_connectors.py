@@ -19,6 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import api.ingest as ingest_module
+from auth import identity
 from connectors import registry as connector_registry
 from connectors import verification
 from data import scope_store
@@ -225,7 +226,7 @@ def test_ip_allowlist_fails_closed_when_forwarded_chain_is_too_short(client, fak
 def test_ip_allowlist_honours_configured_proxy_hop_count(client, fake_db, monkeypatch):
     """Two hops (a custom load balancer in front of Cloud Run) shifts
     which entry is authoritative."""
-    monkeypatch.setenv(verification._TRUSTED_PROXY_HOPS_ENV, "2")
+    monkeypatch.setenv(identity._TRUSTED_PROXY_HOPS_ENV, "2")
     _register(fake_db, strategy="ip_allowlist", header=None, prefix=None)
 
     resp = client.post(

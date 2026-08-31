@@ -57,9 +57,20 @@ def _api_tokens(monkeypatch):
 @pytest.fixture(autouse=True)
 def _reset_rate_limiters():
     """Limiter state is per-process and would otherwise carry request
-    counts from one test into the next."""
+    counts from one test into the next. The pre-auth limiters in
+    particular (a tight budget by design - see auth/identity.py's
+    build_pre_auth_limiter) exhaust within a single test FILE's worth of
+    requests if left unreset, not just across a long-running deployment -
+    the exact failure mode that surfaced when they were added and this
+    list wasn't updated to match."""
     yield
-    for module_name, attr in (("api.ingest", "_INGEST_LIMITER"), ("console.ui", "_CONSOLE_LIMITER")):
+    for module_name, attr in (
+        ("api.ingest", "_INGEST_LIMITER"),
+        ("api.ingest", "_WEBHOOK_LIMITER"),
+        ("api.ingest", "_PRE_LOOKUP_WEBHOOK_LIMITER"),
+        ("console.ui", "_CONSOLE_LIMITER"),
+        ("console.ui", "_PRE_AUTH_LIMITER"),
+    ):
         module = sys.modules.get(module_name)
         limiter = getattr(module, attr, None) if module else None
         if limiter is not None:

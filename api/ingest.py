@@ -110,6 +110,7 @@ _INGEST_LIMITER = identity.build_ingest_limiter()
 # burst far higher than an operator would - but it still fans out into
 # paid model calls, so it is bounded rather than unlimited.
 _WEBHOOK_LIMITER = identity.build_webhook_limiter()
+_PRE_LOOKUP_WEBHOOK_LIMITER = identity.build_pre_auth_limiter()
 
 
 def _authenticate(authorization: Optional[str], requested_org: Optional[str]) -> str:
@@ -473,6 +474,22 @@ async def webhook(connector_id: str, request: Request):
     """
     if not connector_registry.valid_connector_id(connector_id):
         raise HTTPException(status_code=404, detail="no such connector")
+
+    # Checked before the Firestore lookup below, not after: found in a
+    # security self-review that connector_registry.load() - a real read -
+    # ran with NO rate limit at all, since _WEBHOOK_LIMITER is keyed by
+    # config.org_id and that value doesn't exist until AFTER the lookup
+    # succeeds. An unauthenticated caller hammering /webhook/{any-id} paid
+    # for and unlimited-ly triggered Firestore reads regardless of
+    # whether the id was even real. IP-keyed, not org-keyed, since there
+    # is no tenant identity yet at this point - this is a coarser,
+    # earlier backstop; the org-keyed check below still runs once one is
+    # known, as the real per-connector budget.
+    client_ip = identity.resolve_client_address(request.headers) or "unknown"
+    try:
+        _PRE_LOOKUP_WEBHOOK_LIMITER.check(client_ip)
+    except identity.RateLimitExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
 
     raw_body = await request.body()
     if len(raw_body) > _MAX_TEXT_PAYLOAD_BYTES:

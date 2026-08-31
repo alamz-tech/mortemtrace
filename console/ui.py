@@ -172,6 +172,7 @@ async def _last_admin_handler(request: Request, exc: scope_store.LastAdminError)
 
 
 _CONSOLE_LIMITER = identity.build_console_limiter()
+_PRE_AUTH_LIMITER = identity.build_pre_auth_limiter()
 
 
 # --------------------------------------------------------------------------
@@ -324,6 +325,28 @@ def _resolve_org_id(authorization: Optional[str], org_id: Optional[str],
     """Authenticates the caller and returns the tenant they may read."""
     principal = _authenticate_request(authorization, request)
     return _authorize_and_rate_limit(principal, org_id)
+
+
+def _check_pre_auth_rate_limit(request: Request) -> None:
+    """For routes reachable before any credential check - Home Realm
+    Discovery and invite-link redemption - which each do a full
+    Firestore collection scan (find_organization_by_sso_domain_hint,
+    find_invitation_by_token) with NO rate limit at all otherwise.
+
+    _CONSOLE_LIMITER is keyed by org_id and only reached AFTER
+    authentication succeeds via _authorize_and_rate_limit - a pre-auth
+    route never gets there, so it was unlimited by construction, not
+    oversight. Keyed by client IP instead, since there is no tenant
+    identity yet at this point. A caller with no resolvable IP (a
+    malformed/absent X-Forwarded-For) still gets bucketed under a shared
+    key rather than skipping the limit entirely - coarser than per-IP,
+    but strictly better than unlimited.
+    """
+    client_ip = identity.resolve_client_address(request.headers) or "unknown"
+    try:
+        _PRE_AUTH_LIMITER.check(client_ip)
+    except identity.RateLimitExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
 
 
 def _require_session_principal(request: Request) -> identity.Principal:
@@ -702,6 +725,7 @@ async def auth_login_org(request: Request):
     if one is configured. No such org, or no SSO configured for it, is
     reported plainly rather than guessed around - Google Sign-In is
     always offered as the fallback on the same page."""
+    _check_pre_auth_rate_limit(request)
     form = await request.form()
     email = str(form.get("email") or "").strip().lower()
     invite = str(form.get("invite") or "").strip() or None
@@ -887,6 +911,7 @@ def invite_redeem_entry(request: Request, token: str):
     same-domain org SSO login is still reachable from /login itself if
     the invitee prefers it, since the invite token also survives that
     path via the login form's hidden field."""
+    _check_pre_auth_rate_limit(request)
     cookie = request.cookies.get(SESSION_COOKIE)
     try:
         principal = identity.authenticate_session(cookie)

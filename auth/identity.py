@@ -539,3 +539,88 @@ def build_webhook_limiter() -> TokenBucketLimiter:
         capacity=_int_env("MORTEMTRACE_WEBHOOK_BURST", 100),
         refill_per_second=float(_int_env("MORTEMTRACE_WEBHOOK_PER_MINUTE", 300)) / 60.0,
     )
+
+
+def build_pre_auth_limiter() -> TokenBucketLimiter:
+    """For routes reachable before any credential is checked: Home Realm
+    Discovery (console/ui.py's /auth/login/org), invitation-link
+    redemption, and the webhook connector lookup (api/ingest.py) before
+    it can resolve which connector's own rate limit applies.
+
+    Found in a security self-review: each of these did a full Firestore
+    collection scan (or, for the webhook route, at least one document
+    read) with no rate limit at all - _CONSOLE_LIMITER/_INGEST_LIMITER
+    are keyed by org_id and only reachable AFTER authentication succeeds,
+    so a pre-auth route was unlimited by construction, not by oversight.
+    Keyed by client IP rather than org_id, since there is no tenant
+    identity yet at this point - see resolve_client_address.
+    """
+    return TokenBucketLimiter(
+        capacity=_int_env("MORTEMTRACE_PRE_AUTH_BURST", 20),
+        refill_per_second=float(_int_env("MORTEMTRACE_PRE_AUTH_PER_MINUTE", 60)) / 60.0,
+    )
+
+
+# --------------------------------------------------------------------------
+# Client address resolution (X-Forwarded-For)
+#
+# Shared by build_pre_auth_limiter's callers and connectors/verification.py's
+# ip_allowlist strategy - one implementation, not two, of a check that is
+# easy to get subtly wrong (see the docstring below) and was actually
+# wrong here once already.
+# --------------------------------------------------------------------------
+
+_TRUSTED_PROXY_HOPS_ENV = "MORTEMTRACE_TRUSTED_PROXY_HOPS"
+_DEFAULT_TRUSTED_PROXY_HOPS = 1  # Cloud Run: one Google front-end hop
+
+
+def _trusted_proxy_hops() -> int:
+    raw = os.environ.get(_TRUSTED_PROXY_HOPS_ENV)
+    if raw is None:
+        return _DEFAULT_TRUSTED_PROXY_HOPS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "%s=%r is not an integer; falling back to %d",
+            _TRUSTED_PROXY_HOPS_ENV, raw, _DEFAULT_TRUSTED_PROXY_HOPS,
+        )
+        return _DEFAULT_TRUSTED_PROXY_HOPS
+
+
+def resolve_client_address(headers) -> Optional[str]:
+    """Resolves the caller's address from X-Forwarded-For, counting from
+    the RIGHT, not the left.
+
+    Reading the leftmost entry is the intuitive choice and the wrong one:
+    Google's front end *appends* to any X-Forwarded-For the client
+    already sent, so a caller who sends their own
+    `X-Forwarded-For: <anything>` arrives as `<anything>, <their-real-ip>,
+    <gfe>` - trusting position 0 hands them whatever they typed. Only the
+    entries the infrastructure itself appended can be trusted, and those
+    are at the right-hand end. `hops` is configurable because the correct
+    value is a property of deployment topology (one Google front end by
+    default; add one for a custom load balancer in front of it), and a
+    wrong value fails closed (returns None) rather than silently trusting
+    the wrong entry.
+
+    Returns None - never raises - on a missing or too-short header, so
+    every caller decides for itself what "no address" means for its own
+    purpose (a rate limiter degrading open vs. an allowlist check failing
+    closed are different, both legitimate, answers to the same gap).
+
+    `headers` is duck-typed to whatever `.get(name, default)` a caller's
+    header mapping supports - FastAPI's Request.headers and a plain dict
+    (connectors/verification.py's raw dict of lower-cased header names)
+    both satisfy this with no adapter needed.
+    """
+    forwarded = headers.get("x-forwarded-for", "")
+    parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+    if not parts:
+        return None
+
+    hops = _trusted_proxy_hops()
+    index = len(parts) - 1 - hops
+    if index < 0:
+        return None
+    return parts[index]

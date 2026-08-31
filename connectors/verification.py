@@ -121,57 +121,22 @@ def _verify_bearer(config: ConnectorConfig, headers: dict, body: bytes) -> None:
         raise VerificationFailed("bearer token mismatch")
 
 
-_TRUSTED_PROXY_HOPS_ENV = "MORTEMTRACE_TRUSTED_PROXY_HOPS"
-_DEFAULT_TRUSTED_PROXY_HOPS = 1  # Cloud Run: one Google front-end hop
-
-
-def _trusted_proxy_hops() -> int:
-    raw = os.environ.get(_TRUSTED_PROXY_HOPS_ENV)
-    if raw is None:
-        return _DEFAULT_TRUSTED_PROXY_HOPS
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        logger.error(
-            "%s=%r is not an integer; falling back to %d",
-            _TRUSTED_PROXY_HOPS_ENV, raw, _DEFAULT_TRUSTED_PROXY_HOPS,
-        )
-        return _DEFAULT_TRUSTED_PROXY_HOPS
-
-
 def _client_address(headers: dict) -> str:
-    """Resolves the caller's address from X-Forwarded-For, counting from
-    the RIGHT.
+    """Thin wrapper over auth.identity.resolve_client_address, which is
+    now the single implementation of "which X-Forwarded-For entry is the
+    real client" - shared with the pre-auth rate limiters in console/ui.py
+    and api/ingest.py, rather than a second copy of logic that was
+    already wrong here once (see git history: it originally trusted the
+    LEFTMOST entry, which a caller fully controls)."""
+    from auth import identity
 
-    Reading the leftmost entry is the intuitive choice and the wrong one
-    here. Google's front end *appends* to any X-Forwarded-For the client
-    already sent, so a caller who sends `X-Forwarded-For: <allowlisted-ip>`
-    arrives as `<allowlisted-ip>, <their-real-ip>, <gfe>` - and trusting
-    position 0 hands them the allowlist. Only the entries the
-    infrastructure itself appended can be trusted, and those are at the
-    right-hand end.
-
-    So: strip `hops` trusted proxies off the right, and take the entry
-    immediately before them. Anything further left is caller-supplied and
-    ignored. `hops` is configurable because the correct value is a
-    property of the deployment topology (one Google front end by default;
-    add one for a custom load balancer in front of it), and a wrong value
-    fails closed rather than silently trusting the wrong entry.
-    """
-    forwarded = headers.get("x-forwarded-for", "")
-    parts = [p.strip() for p in forwarded.split(",") if p.strip()]
-    if not parts:
-        raise VerificationFailed("no client address available to match against the allowlist")
-
-    hops = _trusted_proxy_hops()
-    index = len(parts) - 1 - hops
-    if index < 0:
+    resolved = identity.resolve_client_address(headers)
+    if resolved is None:
         raise VerificationFailed(
-            f"X-Forwarded-For has {len(parts)} entr{'y' if len(parts) == 1 else 'ies'} but "
-            f"{hops} trusted proxy hop(s) are configured ({_TRUSTED_PROXY_HOPS_ENV}); "
-            "refusing to guess which entry is the real client"
+            "no client address available (missing, empty, or too-short X-Forwarded-For) "
+            "to match against the allowlist"
         )
-    return parts[index]
+    return resolved
 
 
 def _verify_ip_allowlist(config: ConnectorConfig, headers: dict, body: bytes) -> None:
