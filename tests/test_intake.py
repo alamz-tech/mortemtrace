@@ -95,6 +95,59 @@ def test_intake_extracts_and_stages_happy_path(fake_db, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# Idempotency across Pub/Sub redelivery
+#
+# Regression: event_id used to be new_id("evt") - fresh and random on
+# every call - which made write()'s idempotency_key unique every time
+# too, so a real redelivery of the same evidence.received message minted
+# a SECOND IncidentEvent and Ledger appended a duplicate timeline entry.
+# --------------------------------------------------------------------------
+
+def test_redelivering_the_same_evidence_produces_the_same_event_id(fake_db, monkeypatch):
+    """The actual fix: two invocations for the same (run_id,
+    raw_evidence_id) - exactly what a Pub/Sub redelivery of one message
+    looks like - must converge on one IncidentEvent, not two."""
+    _seed_intake_scopes(fake_db)
+    _seed_raw_evidence(fake_db)
+    monkeypatch.setattr(
+        "gateway.agent_gateway.invoke",
+        _canned_invoke('{"action": "pod restarted", "confidence": 0.9}'),
+    )
+    claim = _claim()
+    envelope = _envelope()
+
+    first = intake.run(claim, envelope)
+    second = intake.run(claim, envelope)
+
+    assert first.status == "ok"
+    assert second.status == "ok"
+    first_event_id = first.next_events[0].payload["event_id"]
+    second_event_id = second.next_events[0].payload["event_id"]
+    assert first_event_id == second_event_id
+    assert len(_committed_events(fake_db)) == 1  # not 2
+
+
+def test_different_evidence_in_the_same_run_gets_different_event_ids(fake_db, monkeypatch):
+    """Guards against over-collapsing: two genuinely different pieces of
+    evidence staged within the same run_id must not be conflated into
+    one event just because they share a run_id."""
+    _seed_intake_scopes(fake_db)
+    _seed_raw_evidence(fake_db, raw_evidence_id="raw_1")
+    _seed_raw_evidence(fake_db, raw_evidence_id="raw_2", payload="second, unrelated observation")
+    monkeypatch.setattr(
+        "gateway.agent_gateway.invoke",
+        _canned_invoke('{"action": "pod restarted", "confidence": 0.9}'),
+    )
+    claim = _claim()
+
+    first = intake.run(claim, _envelope(raw_evidence_id="raw_1"))
+    second = intake.run(claim, _envelope(raw_evidence_id="raw_2"))
+
+    assert first.next_events[0].payload["event_id"] != second.next_events[0].payload["event_id"]
+    assert len(_committed_events(fake_db)) == 2
+
+
+# --------------------------------------------------------------------------
 # Missing raw evidence
 # --------------------------------------------------------------------------
 

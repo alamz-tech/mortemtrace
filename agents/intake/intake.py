@@ -17,13 +17,14 @@ infers a cause; it only stages one observation for Ledger to reconcile.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 
 from pydantic import BaseModel, Field, ValidationError
 
 from agents.contracts import NextEvent, RunResult
 from data import scope_store
-from data.models import Collection, Envelope, EvidenceStaged, IncidentEvent, OrgClaim, new_id, now
+from data.models import Collection, Envelope, EvidenceStaged, IncidentEvent, OrgClaim, now
 from gateway import agent_gateway
 
 logger = logging.getLogger("mortemtrace.intake")
@@ -110,7 +111,7 @@ def run(claim: OrgClaim, envelope: Envelope) -> RunResult:
 
     incident_ref = envelope.payload.get("incident_ref")
     event = IncidentEvent(
-        event_id=new_id("evt"),
+        event_id=_deterministic_event_id(claim.run_id, raw_evidence_id),
         org_id=claim.org_id,
         incident_ref=incident_ref,
         status="staged",
@@ -143,6 +144,31 @@ def run(claim: OrgClaim, envelope: Envelope) -> RunResult:
         tokens_used=invoke_result.tokens_used,
         turns=invoke_result.turns,
     )
+
+
+def _deterministic_event_id(run_id: str, raw_evidence_id: str) -> str:
+    """Regression: this used to be `new_id("evt")` - a fresh random id on
+    every call - which made the write()'s idempotency_key
+    (f"{run_id}:{event_id}") unique on every invocation too, so the
+    duplicate-write guard could never actually fire. Pub/Sub's guarantee
+    is at-least-once; a real redelivery of the same evidence.received
+    message re-ran Intake, minted a second IncidentEvent under a second
+    id, and Ledger appended a second, duplicate timeline entry - because
+    Ledger's own dedup (_has_duplicate_source) compares source_event_ids,
+    and the two deliveries no longer shared one.
+
+    Deriving the id from (run_id, raw_evidence_id) instead - the two
+    values that identify "this evidence, this delivery chain" - makes a
+    redelivery recompute the SAME event_id. That alone closes the whole
+    chain: the write is now genuinely a no-op the second time, and even
+    if it weren't, Ledger would append the same source_event_ids twice
+    and its own existing dedup would catch it. Not the run_id-derived
+    event_id, the raw_evidence_id-derived choice specifically - two
+    genuinely distinct pieces of evidence for the same incident, staged
+    in the same run, must still get two different events.
+    """
+    digest = hashlib.sha256(f"{run_id}:{raw_evidence_id}".encode()).hexdigest()
+    return f"evt_{digest[:12]}"
 
 
 def _prompt_for(raw: dict) -> str:
