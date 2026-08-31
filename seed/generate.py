@@ -203,6 +203,15 @@ def _incident_1_bundle(claim_org: str):
 # --------------------------------------------------------------------------
 # Incidents 2 and 3 - lighter: prove severity/data-touched variance and
 # give Watcher two genuinely unrelated active incidents to leave untouched.
+#
+# Still carry a real committed timeline, not just Incident+Classification:
+# Diagnosis/Postmortem/Comms all read Collection.TIMELINE and correctly
+# dead-letter when it's absent (the same hallucination guard as everywhere
+# else - no source, no draft). Without a timeline these two incidents
+# could never show departmental drafts at all, no matter how the fan-out
+# was triggered, and every visitor to the demo console who wasn't also
+# incident 1 would see two-thirds of the seeded incidents looking
+# permanently unfinished.
 # --------------------------------------------------------------------------
 
 def _incident_2_bundle(claim_org: str):
@@ -211,13 +220,35 @@ def _incident_2_bundle(claim_org: str):
         opened_at=now() - timedelta(hours=2), status="open", severity="sev3",
         services_affected=["search-api"], alert_source="datadog",
     )
+
+    raw_log = RawEvidence(
+        event_id="eventraw_seed_log_2", org_id=claim_org, incident_ref=incident.incident_id,
+        kind="log", payload=(
+            "2026-08-26T13:14:00Z search-api p99 latency 4200ms (baseline 180ms), "
+            "elasticsearch cluster yellow, 2 of 6 data nodes unresponsive to health check"
+        ), received_at=incident.opened_at,
+    )
+    event_log = IncidentEvent(
+        event_id="evt_seed_log_2", org_id=claim_org, incident_ref=incident.incident_id,
+        status="committed", confidence=0.86,
+        extracted={"action": "search-api p99 latency spiked to 4200ms, elasticsearch cluster degraded"},
+        ts=raw_log.received_at, source_ref=raw_log.event_id,
+    )
+    timeline = Timeline(
+        incident_id=incident.incident_id, org_id=claim_org,
+        entries=[TimelineEntry(
+            ts=event_log.ts, actor="datadog", action=event_log.extracted["action"],
+            evidence=raw_log.payload, source_event_ids=[event_log.event_id],
+        )],
+        last_updated=event_log.ts,
+    )
     classification = Classification(
         incident_id=incident.incident_id, org_id=claim_org,
         severity="sev3", services=["search-api"],
         downtime_windows=[{"start": incident.opened_at.isoformat(), "end": None, "services": ["search-api"]}],
         data_touched=False, data_categories=[],
     )
-    return incident, classification
+    return incident, [raw_log], [event_log], timeline, classification
 
 
 def _incident_3_bundle(claim_org: str):
@@ -226,13 +257,36 @@ def _incident_3_bundle(claim_org: str):
         opened_at=now() - timedelta(hours=1), status="open", severity="sev2",
         services_affected=["billing-service"], alert_source="datadog",
     )
+
+    raw_log = RawEvidence(
+        event_id="eventraw_seed_log_3", org_id=claim_org, incident_ref=incident.incident_id,
+        kind="log", payload=(
+            "2026-08-26T14:32:11Z billing-service WARN invoice queue depth 8400 "
+            "(baseline under 200), consumer lag increasing, downstream Stripe webhook "
+            "delivery delayed 6-11 minutes for pending charges"
+        ), received_at=incident.opened_at,
+    )
+    event_log = IncidentEvent(
+        event_id="evt_seed_log_3", org_id=claim_org, incident_ref=incident.incident_id,
+        status="committed", confidence=0.83,
+        extracted={"action": "billing-service invoice queue backed up, Stripe webhook delivery delayed"},
+        ts=raw_log.received_at, source_ref=raw_log.event_id,
+    )
+    timeline = Timeline(
+        incident_id=incident.incident_id, org_id=claim_org,
+        entries=[TimelineEntry(
+            ts=event_log.ts, actor="datadog", action=event_log.extracted["action"],
+            evidence=raw_log.payload, source_event_ids=[event_log.event_id],
+        )],
+        last_updated=event_log.ts,
+    )
     classification = Classification(
         incident_id=incident.incident_id, org_id=claim_org,
         severity="sev2", services=["billing-service"],
         downtime_windows=[{"start": incident.opened_at.isoformat(), "end": None, "services": ["billing-service"]}],
         data_touched=False, data_categories=[],
     )
-    return incident, classification
+    return incident, [raw_log], [event_log], timeline, classification
 
 
 # --------------------------------------------------------------------------
@@ -279,9 +333,17 @@ def generate(org_id: str = DEMO_ORG_ID_DEFAULT, *, public_demo: bool = False) ->
     written["classifications"] += 1
 
     for bundle_fn in (_incident_2_bundle, _incident_3_bundle):
-        incident, classification = bundle_fn(org_id)
+        incident, raw_list, event_list, timeline, classification = bundle_fn(org_id)
         scope_store.bootstrap_write(Collection.INCIDENTS, incident.incident_id, incident.model_dump(mode="json"), org_id=org_id)
         written["incidents"] += 1
+        for raw in raw_list:
+            scope_store.bootstrap_write(Collection.RAW_EVIDENCE, raw.event_id, raw.model_dump(mode="json"), org_id=org_id)
+            written["raw_evidence"] += 1
+        for event in event_list:
+            scope_store.bootstrap_write(Collection.EVENTS, event.event_id, event.model_dump(mode="json"), org_id=org_id)
+            written["events"] += 1
+        scope_store.bootstrap_write(Collection.TIMELINE, incident.incident_id, timeline.model_dump(mode="json"), org_id=org_id)
+        written["timelines"] += 1
         scope_store.bootstrap_write(Collection.CLASSIFICATION, incident.incident_id, classification.model_dump(mode="json"), org_id=org_id)
         written["classifications"] += 1
 

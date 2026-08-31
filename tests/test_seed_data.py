@@ -20,7 +20,7 @@ def test_every_seeded_record_validates_against_its_model(fake_db):
 
     assert summary == {
         "services": 5, "customers": 3, "incidents": 3,
-        "raw_evidence": 2, "events": 2, "timelines": 1, "classifications": 3,
+        "raw_evidence": 4, "events": 4, "timelines": 3, "classifications": 3,
     }
 
     for path, data in fake_db._docs.items():
@@ -40,18 +40,27 @@ def test_every_seeded_record_validates_against_its_model(fake_db):
 
 
 def test_timeline_source_event_ids_all_trace_to_real_events(fake_db):
+    """Covers all three seeded timelines, not just incident 1's - incidents
+    2 and 3 carry a real committed timeline too (not just Incident +
+    Classification), so Diagnosis/Postmortem/Comms can actually draft
+    from them instead of correctly refusing to draft from nothing."""
     generate(TEST_ORG)
 
-    timeline_doc = fake_db._docs[("tenants", TEST_ORG, "timeline", "inc_seed_checkout_outage")]
-    timeline = Timeline.model_validate(timeline_doc)
     real_event_ids = {
         doc["event_id"] for path, doc in fake_db._docs.items()
         if path[:3] == ("tenants", TEST_ORG, "events")
     }
 
-    for entry in timeline.entries:
-        for source_id in entry.source_event_ids:
-            assert source_id in real_event_ids, f"dangling source_event_id: {source_id}"
+    seeded_incident_ids = [
+        "inc_seed_checkout_outage", "inc_seed_search_degraded", "inc_seed_billing_delay",
+    ]
+    for incident_id in seeded_incident_ids:
+        timeline_doc = fake_db._docs[("tenants", TEST_ORG, "timeline", incident_id)]
+        timeline = Timeline.model_validate(timeline_doc)
+        assert timeline.entries, f"{incident_id} has a committed timeline with no entries"
+        for entry in timeline.entries:
+            for source_id in entry.source_event_ids:
+                assert source_id in real_event_ids, f"dangling source_event_id: {source_id}"
 
 
 def test_public_demo_flag_writes_an_organization_record(fake_db):

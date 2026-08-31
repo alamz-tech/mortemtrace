@@ -1,15 +1,25 @@
 # Blog post draft
 
 For the bonus checklist item: "Blog post on how it was built, public, stating it was
-created for this hackathon (+0.2)." Post this publicly (personal blog, Medium, dev.to,
-wherever) and link it from the Devpost submission. Edit freely — this is a draft, not a
-final copy.
+created for this hackathon (+0.2)." LinkedIn's own long-form "Write article" feature is a
+good venue for this — public by default, no separate account needed. Edit freely, this is
+a draft.
+
+**Sequencing note, worth reading before publishing:** the "self-review" section below
+references a security review that found real issues in the auth work, some of which are
+still open at the time of writing. The post deliberately does not describe attack
+mechanics — no routes, no payloads, no reproduction steps — but publishing it *before*
+those issues are fixed still means saying "this system has known holes" about a live,
+public URL. Hold off until the P0 fixes have shipped, then this reads as "we found this
+and closed it," which is both more accurate and a better story.
 
 ---
 
 ## Title: What actually breaks when you deploy an "architecturally correct" multi-agent system
 
-*Built for Google's All Things Agentic Hackathon (Fortified Enterprise Fleet category).*
+*Built for Google's All Things Agentic Hackathon (Fortified Enterprise Fleet category).
+This post — and the multi-agent system it describes — were created for the purposes of
+entering this hackathon.*
 
 I spent the first four days of this hackathon getting the architecture right: a single
 committed incident timeline, four departments reading it at four different scopes,
@@ -138,18 +148,53 @@ one message and returns immediately, and each downstream agent invocation arrive
 own separate, independently-authenticated HTTP delivery. More code, and it's the correct
 code — the one that matches what the architecture already claimed.
 
-### The pattern
+### Bug five: a login that redirected correctly and still failed
 
-Every one of these bugs shares a shape: the code was locally coherent — it typechecked,
-it read correctly, it passed every test I'd written against a mock — and it was wrong in
-a way that only a live system, hit with a live request, would ever surface. None of them
-were caught by more unit tests. All of them were caught by deploying early, deliberately
-sending the exact adversarial input the spec's own acceptance criteria described, and
-reading the actual response instead of trusting that green tests meant a working system.
+Later in the build, the system needed real human authentication — every early version had
+resolved "which tenant is this request for" from a plain form field, which is fine for a
+solo demo and a real problem the moment a second tenant exists. The fix was Google/org
+sign-in over OIDC: PKCE, state, nonce, the works.
 
-The lesson isn't "test less." It's that a mocked integration point is a *hypothesis*
-about what the real thing does, and the only way to find out you're wrong is to ask the
-real thing.
+Live testing again found the gap unit tests couldn't: a real login would redirect to
+Google, come back to our callback with a real authorization code, and then fail with
+`invalid_grant: code_verifier or verifier is not needed`. The library we used generates a
+PKCE `code_verifier` when you ask it to — but only attaches the matching `code_challenge`
+to the *authorization* URL if you configured the client with `code_challenge_method="S256"`
+at construction time, a separate step from passing the verifier itself. Skip that one
+argument and the two halves of PKCE silently stop talking to each other: Google never
+receives a challenge, then correctly rejects the verifier we present later, because as far
+as Google is concerned no PKCE flow was ever started. One keyword argument, and the fix
+came with a test that actually inspects the resulting URL's query string — the thing every
+earlier test in that file had stubbed away.
+
+### The pattern, and the one that scales past code review
+
+Every bug above shares a shape: locally coherent, wrong only against the real system.
+None were caught by more unit tests; all were caught by deploying early and sending the
+adversarial input the spec described, then reading the actual response.
+
+That pattern holds for one engineer's code review too, which is worth saying honestly:
+partway through the build I ran a full self-review — architecture, security, reliability,
+the works — against the finished system, treating my own code the way I'd treat a
+stranger's pull request. It found things I'd missed while building quickly under time
+pressure: a data-consistency bug in how duplicate delivery was supposed to be prevented,
+a feature that was documented but never actually wired up, and — the one worth being
+honest about in public — real gaps in the new authentication surface, in the part of the
+system that decides which organization's data a request is allowed to touch. Nothing in
+the core scope-enforcement design was wrong; the newest code, built under the same time
+pressure as everything else, hadn't been checked with the same rigor as the rest.
+
+I'm not going to describe the specifics here — writing exploit mechanics into a public
+post about a live system is a bad trade regardless of how fixed it currently is — but the
+shape of it is worth naming: it's the same failure mode as every bug above, one level up.
+A mocked test is a hypothesis about what the real dependency does. A quick self-review
+under deadline pressure is a hypothesis about what your own code does. Both are worth
+running. Neither is worth trusting instead of actually checking.
+
+The lesson isn't "test less" or "review less." It's that any check you didn't actually
+run — a mock, a skimmed diff, an assumption that yesterday's careful code stayed careful
+today — is a hypothesis, not a fact, and the only way to find out you're wrong is to
+actually ask the real thing.
 
 ---
 
