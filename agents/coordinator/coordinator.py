@@ -11,6 +11,7 @@ recreated each time.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import random
 import time
@@ -34,6 +35,21 @@ GUARDIAN_VERSION = "1.0.0"
 _MAX_TURNS = 20
 _MAX_TOKENS = 200_000
 _MAX_RETRIES = 3
+
+# A worker raising one of these did not fail because of a transient
+# network/quota blip - it failed because of malformed data or a
+# programming error, and will raise the identical exception on every
+# retry. Backing off and retrying it three times only spends ~24s of
+# wall-clock time (see _BACKOFF_BASE_SECONDS) making the eventual
+# dead-letter slower, which compounds the ack-deadline risk documented on
+# _dispatch_concurrently - a KeyError from a malformed staged event
+# (agents/ledger/ledger.py's `event["ts"]`) is exactly this case, found
+# live. Deliberately conservative: only exception types that are never
+# used by this codebase's own transient/network failure paths (Vertex
+# AI's client raises google.api_core.exceptions.GoogleAPICallError
+# subclasses, not these) are listed, so an exception type not seen before
+# still gets the safe default of a retry.
+_TERMINAL_EXCEPTION_TYPES = (KeyError, TypeError, AttributeError, ValueError, IndexError)
 # 8s base -> backoffs of ~8s, ~16s (~24s total across 2 waits). Widened
 # from an original 1s base (~3s total) after live-testing surfaced real
 # 429 RESOURCE_EXHAUSTED responses from Vertex AI: a per-minute-style
@@ -108,13 +124,71 @@ def route(event_type: str, envelope: Envelope, *, publish: Callable[[str, dict],
         logger.warning("no route for event_type=%s (run=%s)", event_type, envelope.run_id)
         return []
 
-    results = []
-    for agent_name in agent_names:
-        result = dispatch(agent_name, envelope)
-        results.append(result)
+    if len(agent_names) == 1:
+        result = dispatch(agent_names[0], envelope)
         if result.status == "ok":
             for next_event in result.next_events:
                 publish(next_event.topic, next_event.payload)
+        return [result]
+
+    results = _dispatch_concurrently(agent_names, envelope)
+    for result in results:
+        if result.status == "ok":
+            for next_event in result.next_events:
+                publish(next_event.topic, next_event.payload)
+    return results
+
+
+def _dispatch_concurrently(agent_names: list[str], envelope: Envelope) -> list[RunResult]:
+    """Runs every worker subscribed to one event in parallel rather than
+    one after another.
+
+    Found live: timeline.committed fans out to six departments, each
+    making a real, blocking Gemini call. In series that regularly runs
+    past Pub/Sub's 60s push ack deadline (infra/setup_pubsub_push.sh),
+    which redelivers the same message mid-fan-out and re-dispatches every
+    department a second time - the actual cause behind the duplicate-
+    draft bug found and fixed in agents/ledger/ledger.py, one hop
+    earlier, and behind department-level idempotency guards added
+    alongside this fix (diagnosis.py, classifier.py, and the four
+    agents/departments/*.py writers).
+
+    Threads, not asyncio: dispatch() is a synchronous blocking call chain
+    (Firestore reads/writes, a Gemini call) end to end, the same shape as
+    every other blocking-work boundary in this codebase (api/ingest.py's
+    asyncio.to_thread). The six departments are independent of each other
+    by construction - different scopes, different collections written -
+    so there is no ordering dependency stopping them running at once, and
+    Cloud Run already serves this many concurrent requests per instance
+    by default, so concurrent use of the Firestore/Vertex AI clients here
+    is not a new requirement this introduces.
+    """
+    results: list[Optional[RunResult]] = [None] * len(agent_names)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(agent_names)) as pool:
+        future_to_index = {
+            pool.submit(dispatch, agent_name, envelope): i
+            for i, agent_name in enumerate(agent_names)
+        }
+        for future in concurrent.futures.as_completed(future_to_index):
+            index = future_to_index[future]
+            agent_name = agent_names[index]
+            try:
+                results[index] = future.result()
+            except Exception:
+                # dispatch() already converts everything it knows how to
+                # retry or dead-letter into a RunResult; anything that
+                # still escapes here is unexpected. One department's
+                # unexpected failure must not take the other five down
+                # with it - the same "degrade, don't fail the whole run"
+                # posture used everywhere else in this fan-out.
+                logger.exception(
+                    "dispatch of %s raised unexpectedly (run=%s); other "
+                    "departments in this fan-out are unaffected",
+                    agent_name, envelope.run_id,
+                )
+                results[index] = RunResult(
+                    status="dead_letter", detail=f"unexpected exception dispatching {agent_name}",
+                )
     return results
 
 
@@ -244,6 +318,17 @@ def _attempt_with_retry(
             return RunResult(status="dead_letter", detail=f"loop detected: {exc}")
         except scope_store.TenantViolation as exc:
             return RunResult(status="denied", detail=str(exc))
+        except _TERMINAL_EXCEPTION_TYPES as exc:
+            otel_setup.record_metric(
+                "agent_attempt_failed", agent_name=agent_name,
+                run_id=envelope.run_id, org_id=envelope.org_id,
+            )
+            logger.warning(
+                "%s raised a terminal %s (not retrying): %s",
+                agent_name, type(exc).__name__, exc,
+                extra={"run_id": envelope.run_id, "org_id": envelope.org_id, "agent_name": agent_name},
+            )
+            return RunResult(status="dead_letter", detail=f"terminal {type(exc).__name__}: {exc}")
         except Exception as exc:  # transient failure path only
             last_error = exc
             otel_setup.record_metric(

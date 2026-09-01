@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from agents.contracts import NextEvent, RunResult
 from agents.coordinator import coordinator
 from data import scope_store
@@ -207,6 +209,102 @@ def test_route_publishes_declared_next_event(fake_db, clean_coordinator):
                        publish=lambda topic, payload: published.append((topic, payload)))
 
     assert published == [("evidence.staged", {"event_id": "evt_1"})]
+
+
+def test_route_dispatches_fan_out_workers_in_parallel_not_serially(fake_db, clean_coordinator):
+    """Regression for the finding behind the ledger.py and department
+    idempotency fixes: six real, blocking Gemini calls run one after
+    another easily exceed Pub/Sub's 60s push ack deadline
+    (infra/setup_pubsub_push.sh), which redelivers the message mid-fan-out.
+    Six 0.2s workers in series would take >=1.2s; run concurrently, wall
+    time should stay close to the slowest single worker."""
+    _publish_governance_agents(fake_db)
+    names = ["diagnosis", "classifier", "postmortem", "comms", "compliance", "exposure"]
+    for name in names:
+        seed_agent(fake_db, name, "1.0.0", read_scopes=[], write_scopes=[])
+        clean_coordinator.register_worker(name, lambda claim, env: (time.sleep(0.2), RunResult(status="ok"))[1])
+
+    start = time.monotonic()
+    coordinator.route("timeline.committed", _envelope(event_type="timeline.committed"),
+                       publish=lambda topic, payload: None)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 0.6
+
+
+def test_route_publish_order_matches_route_table_not_completion_order(fake_db, clean_coordinator):
+    """Concurrent dispatch must not turn into out-of-order publishing:
+    whichever worker happens to finish first must not jump the queue."""
+    _publish_governance_agents(fake_db)
+    names = ["diagnosis", "classifier", "postmortem", "comms", "compliance", "exposure"]
+    delays = {"diagnosis": 0.05, "classifier": 0.0, "postmortem": 0.03,
+              "comms": 0.0, "compliance": 0.04, "exposure": 0.0}
+
+    def _make_worker(name: str):
+        def _worker(claim, env):
+            time.sleep(delays[name])
+            return RunResult(status="ok", next_events=[NextEvent(topic=f"{name}.done", payload={})])
+        return _worker
+
+    for name in names:
+        seed_agent(fake_db, name, "1.0.0", read_scopes=[], write_scopes=[])
+        clean_coordinator.register_worker(name, _make_worker(name))
+
+    published = []
+    coordinator.route("timeline.committed", _envelope(event_type="timeline.committed"),
+                       publish=lambda topic, payload: published.append(topic))
+
+    assert published == [f"{name}.done" for name in names]
+
+
+def test_dispatch_concurrently_isolates_one_workers_unexpected_exception(clean_coordinator, monkeypatch):
+    """dispatch() already converts everything it knows how to handle into
+    a RunResult, so an exception escaping it (e.g. from guardian.preflight
+    or _touch_run, outside _attempt_with_retry's own try/except) is
+    unexpected - but one department's unexpected failure must not lose
+    the other five departments' real results."""
+    def _fake_dispatch(agent_name, envelope):
+        if agent_name == "compliance":
+            raise RuntimeError("boom")
+        return RunResult(status="ok")
+
+    monkeypatch.setattr(coordinator, "dispatch", _fake_dispatch)
+    names = ["diagnosis", "compliance", "exposure"]
+
+    results = coordinator._dispatch_concurrently(names, _envelope(event_type="timeline.committed"))
+
+    by_name = dict(zip(names, results, strict=True))
+    assert by_name["diagnosis"].status == "ok"
+    assert by_name["exposure"].status == "ok"
+    assert by_name["compliance"].status == "dead_letter"
+
+
+def test_terminal_exception_dead_letters_immediately_without_retry(fake_db, clean_coordinator, monkeypatch):
+    """Regression, found live: a malformed staged event raises a bare
+    KeyError (agents/ledger/ledger.py's event['ts']/event['event_id']
+    indexing), which is deterministic - identical on every retry. Before
+    the retryable/terminal exception taxonomy, this still burned the full
+    ~24s of backoff before dead-lettering, compounding the ack-deadline
+    risk on top of it."""
+    sleeps = []
+    monkeypatch.setattr(coordinator.time, "sleep", lambda s: sleeps.append(s))
+    _publish_governance_agents(fake_db)
+    seed_agent(fake_db, "ledger", "1.0.0", read_scopes=[], write_scopes=[])
+
+    attempts = []
+
+    def _malformed(claim, env):
+        attempts.append(1)
+        raise KeyError("event_id")
+
+    clean_coordinator.register_worker("ledger", _malformed)
+
+    result = coordinator.dispatch("ledger", _envelope())
+
+    assert result.status == "dead_letter"
+    assert "terminal KeyError" in result.detail
+    assert len(attempts) == 1
+    assert sleeps == []
 
 
 def test_new_department_consumes_with_no_coordinator_change(fake_db, clean_coordinator):
