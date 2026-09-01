@@ -172,7 +172,28 @@ def test_ledger_idempotent_on_duplicate_source_event_ids(fake_db):
     assert second.status == "ok"
     timeline = fake_db._docs[("tenants", TEST_ORG, "timeline", "inc_1")]
     assert len(timeline["entries"]) == 1
-    assert second.next_events[0].payload["entry_count"] == 1
+    assert first.next_events[0].payload["entry_count"] == 1
+
+
+def test_ledger_does_not_republish_timeline_committed_on_a_redelivered_duplicate(fake_db):
+    """Regression, found live on the deployed service (a real Pub/Sub
+    redelivery, not a hypothetical one): the duplicate ENTRY was always
+    correctly skipped, but timeline.committed used to be republished
+    unconditionally regardless - which meant a harmless duplicate
+    delivery still re-triggered the entire six-agent departmental
+    fan-out a second time, producing a full set of duplicate drafts from
+    six more real, paid Gemini calls, for a delivery that committed
+    nothing new. The second run must publish no next_events at all."""
+    _seed_ledger_scopes(fake_db)
+    _seed_event(fake_db)
+    claim = _claim()
+    envelope = _envelope()
+
+    ledger.run(claim, envelope)
+    second = ledger.run(claim, envelope)
+
+    assert second.status == "ok"
+    assert second.next_events == []
 
 
 def test_ledger_second_incident_stays_untouched(fake_db):

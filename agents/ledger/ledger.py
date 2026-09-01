@@ -49,19 +49,30 @@ def run(claim: OrgClaim, envelope: Envelope) -> RunResult:
 
     entry = _entry_from_event(event)
 
+    # A plain Python cell, not a Firestore write - safe to set from
+    # inside a retried transaction function despite _append's own "no
+    # side effects" rule, which is about NOT touching external state
+    # (a second write would itself need dedup). Each retry overwrites
+    # this with a fresh, consistent computation; only the value from the
+    # attempt that actually commits is ever read, after
+    # update_in_transaction returns.
+    appended = {"value": False}
+
     def _append(current: dict | None) -> dict:
         """Runs inside a Firestore transaction, and may be retried on
         contention - so it must stay a pure function of `current` with no
-        side effects of its own."""
+        EXTERNAL side effects of its own."""
         timeline = (
             Timeline.model_validate(current)
             if current is not None
             else Timeline(incident_id=incident_ref, org_id=claim.org_id)
         )
-        if not _has_duplicate_source(timeline, entry):
+        is_new = not _has_duplicate_source(timeline, entry)
+        if is_new:
             timeline.entries.append(entry)
             timeline.entries.sort(key=lambda e: e.ts)
         timeline.last_updated = now()
+        appended["value"] = is_new
         return timeline.model_dump(mode="json")
 
     # Transactional because this is a read-modify-write on one shared
@@ -84,6 +95,26 @@ def run(claim: OrgClaim, envelope: Envelope) -> RunResult:
     if committed_event is not None:
         committed_event["status"] = "committed"
         scope_store.write(claim, Collection.EVENTS, event_id, committed_event)
+
+    if not appended["value"]:
+        # Regression, found live on the deployed service: Pub/Sub
+        # redelivered evidence.staged for an event this incident's
+        # timeline already carried (at-least-once delivery - a real,
+        # observed redelivery, not a hypothetical one). The duplicate
+        # ENTRY was correctly skipped by _has_duplicate_source above, but
+        # this function used to publish timeline.committed unconditionally
+        # regardless - which meant a duplicate delivery, though harmless
+        # to the timeline itself, still re-triggered the ENTIRE six-agent
+        # departmental fan-out a second time: six more real, paid Gemini
+        # calls and a full set of duplicate drafts, for a delivery that
+        # committed nothing new. Nothing downstream needs to hear about a
+        # commit that did not happen.
+        logger.info(
+            "ledger: event %s for incident %s was already reflected in the timeline "
+            "(likely a Pub/Sub redelivery) - not republishing timeline.committed",
+            event_id, incident_ref,
+        )
+        return RunResult(status="ok")
 
     next_event = NextEvent(
         topic="timeline.committed",
