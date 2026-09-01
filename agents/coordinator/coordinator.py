@@ -69,6 +69,20 @@ _STATUS_SEVERITY = {
     "clarification_needed": 1, "ok": 0,
 }
 
+# Found live, the day _dispatch_concurrently shipped: Exposure reads
+# Collection.CLASSIFICATION, which Classifier writes - both dispatched
+# from the SAME timeline.committed event. The old sequential loop honored
+# this by accident (Classifier happened to come before Exposure in the
+# list below); concurrent dispatch does not preserve list order, and
+# Exposure's read raced Classifier's write in production, dead-lettering
+# with "no classification record found for incident." Every OTHER
+# department dispatched from timeline.committed reads only Timeline (or,
+# for Compliance's timeline.committed branch, nothing but the deliberate
+# raw_evidence denial proof) - Classifier is the one real same-event
+# producer/consumer dependency among the six, so it is the one name
+# listed here.
+_MUST_PRECEDE_PEERS = {"classifier"}
+
 # event_type -> workers subscribed to it. A single incoming event can
 # fan out to more than one worker - timeline.committed reaches Diagnosis,
 # Classifier, and all four departmental agents independently, matching
@@ -131,11 +145,34 @@ def route(event_type: str, envelope: Envelope, *, publish: Callable[[str, dict],
                 publish(next_event.topic, next_event.payload)
         return [result]
 
-    results = _dispatch_concurrently(agent_names, envelope)
-    for result in results:
+    # Leaders (today, just Classifier - see _MUST_PRECEDE_PEERS) run to
+    # completion first, synchronously, before the rest of the fan-out
+    # starts. Not because ordering matters to the followers themselves -
+    # it doesn't - but because a follower reading what a leader writes
+    # would otherwise race it under concurrent dispatch.
+    leaders = [name for name in agent_names if name in _MUST_PRECEDE_PEERS]
+    followers = [name for name in agent_names if name not in _MUST_PRECEDE_PEERS]
+
+    results: list[RunResult] = []
+    for leader in leaders:
+        result = dispatch(leader, envelope)
+        results.append(result)
         if result.status == "ok":
             for next_event in result.next_events:
                 publish(next_event.topic, next_event.payload)
+
+    if len(followers) == 1:
+        follower_results = [dispatch(followers[0], envelope)]
+    elif followers:
+        follower_results = _dispatch_concurrently(followers, envelope)
+    else:
+        follower_results = []
+
+    for result in follower_results:
+        if result.status == "ok":
+            for next_event in result.next_events:
+                publish(next_event.topic, next_event.payload)
+    results.extend(follower_results)
     return results
 
 
@@ -156,9 +193,11 @@ def _dispatch_concurrently(agent_names: list[str], envelope: Envelope) -> list[R
     Threads, not asyncio: dispatch() is a synchronous blocking call chain
     (Firestore reads/writes, a Gemini call) end to end, the same shape as
     every other blocking-work boundary in this codebase (api/ingest.py's
-    asyncio.to_thread). The six departments are independent of each other
-    by construction - different scopes, different collections written -
-    so there is no ordering dependency stopping them running at once, and
+    asyncio.to_thread). Callers only ever hand this the "follower" names -
+    route() runs anything in _MUST_PRECEDE_PEERS (Classifier) to
+    completion first - so everything passed in here really is independent
+    of everything else passed in here: different scopes, different
+    collections written, no same-event producer/consumer pair among them.
     Cloud Run already serves this many concurrent requests per instance
     by default, so concurrent use of the Firestore/Vertex AI clients here
     is not a new requirement this introduces.

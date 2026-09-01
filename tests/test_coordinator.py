@@ -216,8 +216,9 @@ def test_route_dispatches_fan_out_workers_in_parallel_not_serially(fake_db, clea
     idempotency fixes: six real, blocking Gemini calls run one after
     another easily exceed Pub/Sub's 60s push ack deadline
     (infra/setup_pubsub_push.sh), which redelivers the message mid-fan-out.
-    Six 0.2s workers in series would take >=1.2s; run concurrently, wall
-    time should stay close to the slowest single worker."""
+    Six 0.2s workers in series would take >=1.2s. Classifier (a "leader",
+    per _MUST_PRECEDE_PEERS) still runs first and alone, so the floor here
+    is two 0.2s phases, not one - well under the six-way serial total."""
     _publish_governance_agents(fake_db)
     names = ["diagnosis", "classifier", "postmortem", "comms", "compliance", "exposure"]
     for name in names:
@@ -229,12 +230,15 @@ def test_route_dispatches_fan_out_workers_in_parallel_not_serially(fake_db, clea
                        publish=lambda topic, payload: None)
     elapsed = time.monotonic() - start
 
-    assert elapsed < 0.6
+    assert elapsed < 0.7
 
 
 def test_route_publish_order_matches_route_table_not_completion_order(fake_db, clean_coordinator):
     """Concurrent dispatch must not turn into out-of-order publishing:
-    whichever worker happens to finish first must not jump the queue."""
+    whichever follower happens to finish first must not jump the queue.
+    Classifier (a "leader") publishes first regardless, since it runs to
+    completion before the followers start at all - see
+    _MUST_PRECEDE_PEERS."""
     _publish_governance_agents(fake_db)
     names = ["diagnosis", "classifier", "postmortem", "comms", "compliance", "exposure"]
     delays = {"diagnosis": 0.05, "classifier": 0.0, "postmortem": 0.03,
@@ -254,7 +258,53 @@ def test_route_publish_order_matches_route_table_not_completion_order(fake_db, c
     coordinator.route("timeline.committed", _envelope(event_type="timeline.committed"),
                        publish=lambda topic, payload: published.append(topic))
 
-    assert published == [f"{name}.done" for name in names]
+    expected_order = ["classifier"] + [n for n in names if n != "classifier"]
+    assert published == [f"{name}.done" for name in expected_order]
+
+
+def test_classifier_always_completes_before_exposure_starts(fake_db, clean_coordinator):
+    """Regression, found live in production the day concurrent dispatch
+    shipped: Exposure reads Collection.CLASSIFICATION, which Classifier
+    writes, both dispatched from the same timeline.committed event.
+    Naive concurrent dispatch raced the two and Exposure dead-lettered
+    with "no classification record found for incident" whenever it won
+    the race. Runs several iterations since a race that only sometimes
+    loses would still sometimes pass."""
+    _publish_governance_agents(fake_db)
+    names = ["diagnosis", "classifier", "postmortem", "comms", "compliance", "exposure"]
+    for name in names:
+        seed_agent(fake_db, name, "1.0.0", read_scopes=[], write_scopes=[])
+
+    def _make_classifier(state: dict):
+        def _classifier(claim, env):
+            time.sleep(0.01)
+            state["classified"] = True
+            return RunResult(status="ok")
+        return _classifier
+
+    def _make_exposure(state: dict, sightings: list):
+        def _exposure(claim, env):
+            sightings.append(state["classified"])
+            return RunResult(status="ok")
+        return _exposure
+
+    for i in range(20):
+        state = {"classified": False}
+        exposure_saw_classified: list = []
+        _classifier = _make_classifier(state)
+        _exposure = _make_exposure(state, exposure_saw_classified)
+
+        for name in names:
+            clean_coordinator.register_worker(
+                name, _classifier if name == "classifier" else (
+                    _exposure if name == "exposure" else (lambda claim, env: RunResult(status="ok"))
+                ),
+            )
+
+        coordinator.route("timeline.committed", _envelope(run_id=f"run_race_{i}", event_type="timeline.committed"),
+                           publish=lambda topic, payload: None)
+
+        assert exposure_saw_classified == [True]
 
 
 def test_dispatch_concurrently_isolates_one_workers_unexpected_exception(clean_coordinator, monkeypatch):
