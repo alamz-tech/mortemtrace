@@ -185,6 +185,85 @@ def test_distinct_idempotency_keys_all_apply(fake_db):
     assert all(written)
 
 
+# --------------------------------------------------------------------------
+# Idempotency claim (no accompanying document write): check-then-act race
+# --------------------------------------------------------------------------
+
+def test_concurrent_idempotency_key_claims_apply_once(fake_db):
+    """claim_idempotency_key's own version of the same check-then-act race
+    test_concurrent_writes_with_one_idempotency_key_apply_once covers for
+    write()'s built-in idempotency_key - used by the department agents
+    (diagnosis.py, classifier.py, agents/departments/*.py) to gate
+    multiple writes together rather than piggyback on one document's
+    write() call."""
+    seed_agent(fake_db, "diagnosis", "1.0.0", read_scopes=[], write_scopes=[Collection.HYPOTHESES])
+    barrier = threading.Barrier(8)
+    results: list[bool] = []
+    results_lock = threading.Lock()
+
+    def _claim_key(i: int) -> None:
+        barrier.wait()
+        claimed = scope_store.claim_idempotency_key(
+            _claim(agent="diagnosis", run_id=f"run_{i}"), Collection.HYPOTHESES, "the-same-key",
+        )
+        with results_lock:
+            results.append(claimed)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(_claim_key, range(8)))
+
+    assert sum(results) == 1, "exactly one caller may win the idempotency claim"
+    assert results.count(False) == 7
+
+
+# --------------------------------------------------------------------------
+# Last-admin guard: TOCTOU on concurrent revoke/demote
+# --------------------------------------------------------------------------
+
+def test_concurrent_revokes_of_both_admins_cannot_leave_the_org_with_zero(fake_db):
+    """Before this was transactional, update_membership_role/
+    revoke_membership did get() -> _count_active_admins() -> set() with no
+    atomicity between the count check and the write. With exactly two
+    active admins, two concurrent revokes (each admin revoking the other,
+    maximizing overlap via a barrier) could each read the count as 2, each
+    pass the "would leave more than zero" check, and both commit - leaving
+    the org with zero admins despite the guard existing specifically to
+    prevent that."""
+    org = scope_store.create_organization("Acme Inc.", "admin_a")
+    scope_store.create_membership("admin_b", org["org_id"], "admin")
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+    outcomes_lock = threading.Lock()
+
+    def _revoke(acting: str, target: str) -> None:
+        barrier.wait()
+        try:
+            scope_store.revoke_membership(acting, org["org_id"], target)
+            outcome = "succeeded"
+        except (scope_store.LastAdminError, scope_store.PermissionDenied):
+            # Both are a safe refusal here, not a bug: LastAdminError is
+            # the guard this test targets; PermissionDenied is
+            # _require_admin's own live re-check noticing the ACTOR's own
+            # admin status was revoked by the other concurrent call before
+            # they got to act - equally conservative, since only two
+            # admins exist and each revoke targets the other.
+            outcome = "refused"
+        with outcomes_lock:
+            outcomes.append(outcome)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda args: _revoke(*args), [("admin_a", "admin_b"), ("admin_b", "admin_a")]))
+
+    assert sorted(outcomes) == ["refused", "succeeded"], (
+        "exactly one of the two concurrent revokes may succeed"
+    )
+    remaining_admins = [
+        m for m in scope_store.list_memberships_for_org(org["org_id"])
+        if m["status"] == "active" and m["role"] == "admin"
+    ]
+    assert len(remaining_admins) == 1
+
+
 def test_transactional_write_requires_read_scope_too(fake_db):
     """A read-modify-write hands the current document to `mutate`, so
     authorizing only the write would let an agent with write-but-not-read

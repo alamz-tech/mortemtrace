@@ -88,6 +88,29 @@ def test_happy_path_writes_postmortem_draft_with_nonempty_source_refs(fake_db, m
     assert "evt_1" in draft["source_refs"]
 
 
+def test_redelivery_of_the_same_run_does_not_write_a_second_draft(fake_db, monkeypatch):
+    """Regression: timeline.committed's six-way departmental fan-out can
+    outrun Pub/Sub's ack deadline and get redelivered
+    (agents/coordinator/coordinator.py's _dispatch_concurrently docstring).
+    A second dispatch with the SAME run_id/incident_id must not write a
+    second, independent draft."""
+    _seed_postmortem_agent(fake_db)
+    _seed_timeline(fake_db)
+    _seed_hypothesis(fake_db)
+    stub_gateway(monkeypatch, text=json.dumps({
+        "body": "At 03:14 UTC pods began restarting; root cause was a memory-exhausting deploy.",
+        "runbook_proposal": "Add a memory ceiling alert before OOM triggers a restart loop.",
+    }))
+    envelope = _envelope()
+
+    first = postmortem.run(_claim(), envelope)
+    second = postmortem.run(_claim(), envelope)
+
+    assert first.status == "ok"
+    assert second.status == "ok"
+    assert len(_drafts(fake_db)) == 1
+
+
 def test_model_armor_block_returns_blocked_and_writes_nothing(fake_db, monkeypatch):
     _seed_postmortem_agent(fake_db)
     _seed_timeline(fake_db)

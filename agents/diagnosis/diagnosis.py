@@ -120,6 +120,23 @@ def run(claim: OrgClaim, envelope: Envelope) -> RunResult:
             tokens_used=invoked.tokens_used, turns=invoked.turns,
         )
 
+    # Claimed after the model call, not before: see claim_idempotency_key's
+    # docstring for why claiming first would defeat coordinator's own
+    # same-request retry-on-transient-failure. A duplicate dispatch here
+    # is most likely timeline.committed's six-way fan-out outrunning the
+    # Pub/Sub ack deadline and getting redelivered - without this, each
+    # redelivery wrote a brand-new Hypothesis with a fresh new_id(),
+    # independent of the one already written.
+    if not scope_store.claim_idempotency_key(
+        claim, Collection.HYPOTHESES, f"diagnosis:{claim.run_id}:{incident_id}",
+    ):
+        logger.info(
+            "diagnosis: run %s for incident %s already produced a hypothesis "
+            "(likely a Pub/Sub redelivery) - not writing a duplicate",
+            claim.run_id, incident_id,
+        )
+        return RunResult(status="ok", tokens_used=invoked.tokens_used, turns=invoked.turns)
+
     hypothesis = Hypothesis(
         hypothesis_id=new_id("hyp"),
         incident_ref=incident_id,

@@ -100,6 +100,46 @@ def test_classifier_sets_severity_and_data_touched_false(fake_db, monkeypatch):
     assert next_event.payload["data_touched"] is False
 
 
+def test_redelivery_of_the_same_run_does_not_overwrite_or_republish(fake_db, monkeypatch):
+    """Regression: timeline.committed's six-way departmental fan-out can
+    outrun Pub/Sub's ack deadline and get redelivered
+    (agents/coordinator/coordinator.py's _dispatch_concurrently docstring).
+    Classification is keyed by incident_id, so a redelivery previously
+    overwrote it unconditionally - and since the model call isn't pinned
+    to temperature 0, a redelivery could silently flip data_touched
+    (and, downstream, whether Compliance's GDPR clock starts). It also
+    always re-published incident.classified, re-triggering Compliance's
+    real work a second time."""
+    _seed_classifier_agent(fake_db)
+    _seed_timeline(fake_db)
+    calls = []
+
+    def _fake_invoke(agent, prompt, **kw):
+        calls.append(1)
+        # A different verdict on the second (duplicate) call proves the
+        # guard fires BEFORE any write, not that the model happened to
+        # repeat itself.
+        data_touched = len(calls) > 1
+        return agent_gateway.InvokeResult(
+            text=f'{{"severity": "sev2", "services": ["checkout-worker"], "downtime_windows": [], '
+                 f'"data_touched": {str(data_touched).lower()}, "data_categories": []}}',
+            tokens_used=70, turns=1,
+        )
+
+    monkeypatch.setattr("gateway.agent_gateway.invoke", _fake_invoke)
+    envelope = _envelope()
+
+    first = classifier.run(_claim(), envelope)
+    second = classifier.run(_claim(), envelope)
+
+    assert first.status == "ok"
+    assert second.status == "ok"
+    assert len(first.next_events) == 1
+    assert second.next_events == []
+    written = _classification(fake_db)
+    assert written["data_touched"] is False  # the FIRST call's verdict, untouched by the second
+
+
 # --------------------------------------------------------------------------
 # data_touched = true path
 # --------------------------------------------------------------------------

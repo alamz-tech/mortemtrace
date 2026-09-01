@@ -91,6 +91,20 @@ def run(claim: OrgClaim, envelope: Envelope) -> RunResult:
                           detail="no source_event_ids available; refusing a sourceless draft",
                           turns=result.turns, tokens_used=result.tokens_used)
 
+    # Claimed after the model call, not before - see
+    # scope_store.claim_idempotency_key's docstring. Guards against a
+    # redelivered timeline.committed (the six-way departmental fan-out can
+    # outrun the Pub/Sub ack deadline) writing a second, independent draft.
+    if not scope_store.claim_idempotency_key(
+        claim, Collection.DRAFTS, f"postmortem:{claim.run_id}:{incident_id}",
+    ):
+        logger.info(
+            "postmortem: run %s for incident %s already has a draft "
+            "(likely a Pub/Sub redelivery) - not writing a duplicate",
+            claim.run_id, incident_id,
+        )
+        return RunResult(status="ok", turns=result.turns, tokens_used=result.tokens_used)
+
     draft = PostmortemDraft(
         draft_id=new_id("draft"),
         incident_ref=incident_id,

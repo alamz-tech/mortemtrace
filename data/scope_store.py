@@ -505,6 +505,52 @@ def write(
     return True
 
 
+def claim_idempotency_key(
+    claim: OrgClaim,
+    collection: Collection,
+    key: str,
+    *,
+    path_org_id: Optional[str] = None,
+) -> bool:
+    """Atomically claims a namespaced idempotency key with no accompanying
+    document write. Returns True the first time a key is claimed (the
+    caller should proceed) or False if it was already claimed (the caller
+    should treat this as a duplicate dispatch - most likely a Pub/Sub
+    redelivery - and skip its writes without erroring).
+
+    Distinct from write()'s own `idempotency_key` parameter, which
+    protects exactly one document. This exists for callers whose "did I
+    already do this" guard must gate MULTIPLE writes together - e.g.
+    Compliance's GDPR clock + draft pair, where redelivery must skip both
+    or neither, not dedup the draft while silently re-stamping the clock's
+    deadline forward on every redelivery.
+
+    Callers should claim right before their real (post-model-call)
+    writes, not before invoking the model: claiming first would make a
+    coordinator-level retry-on-transient-failure (a same-request retry of
+    an agent that raised, not a genuine redelivery) see its own earlier
+    claim and skip, turning a retryable failure into a silent no-op that
+    never actually completes the work.
+    """
+    target_org = path_org_id or claim.org_id
+    _authorize(claim, collection, "write", target_org)
+    marker_ref = (
+        _client().collection("tenants").document(target_org)
+        .collection("_idempotency").document(key)
+    )
+    try:
+        marker_ref.create(
+            {"run_id": claim.run_id, "at": firestore.SERVER_TIMESTAMP},
+            timeout=_OP_TIMEOUT_SECONDS,
+        )
+    except AlreadyExists:
+        _audit(claim.org_id, claim.agent_name, claim.agent_version, "allow",
+               "duplicate dispatch skipped (idempotent)",
+               f"{collection.value}/_idempotency/{key}", claim.run_id)
+        return False
+    return True
+
+
 def update_in_transaction(
     claim: OrgClaim,
     collection: Collection,
@@ -956,6 +1002,51 @@ def create_membership(user_id: str, org_id: str, role: str, *, invited_by: Optio
     return document
 
 
+def _last_admin_guarded_update(
+    org_id: str, membership_id: str, target_user_id: str,
+    mutate: Callable[[dict, int], dict],
+) -> dict:
+    """Reads the target membership and re-counts org_id's active admins
+    inside ONE Firestore transaction, then applies `mutate` and writes the
+    result - all atomically.
+
+    Closes a TOCTOU window that plain get() -> _count_active_admins() ->
+    set() left open: with exactly two active admins, two concurrent
+    revoke/demote requests could each read the count as 2, each pass the
+    "would leave more than zero" check, and both commit - leaving the org
+    with zero admins despite the guard existing specifically to prevent
+    that. update_in_transaction() closes the identical class of lost-
+    update race for tenant-scoped documents (see agents/ledger/ledger.py);
+    membership documents live outside any tenant path, at
+    _MEMBERSHIPS_ROOT, so that helper's Collection-based addressing does
+    not apply here and this is its own small transactional counterpart.
+    """
+    client = _client()
+    doc_ref = client.collection(_MEMBERSHIPS_ROOT).document(membership_id)
+
+    def _body(transaction):
+        snap = doc_ref.get(transaction=transaction, timeout=_OP_TIMEOUT_SECONDS)
+        if not snap.exists:
+            raise ValueError(f"no such membership: {target_user_id} in {org_id}")
+        data = snap.to_dict()
+        admins = (
+            client.collection(_MEMBERSHIPS_ROOT)
+            .where(filter=FieldFilter("org_id", "==", org_id))
+            .where(filter=FieldFilter("status", "==", "active"))
+            .where(filter=FieldFilter("role", "==", "admin"))
+            .stream(transaction=transaction, timeout=_OP_TIMEOUT_SECONDS)
+        )
+        active_admin_count = sum(1 for _ in admins)
+        updated = mutate(data, active_admin_count)
+        transaction.set(doc_ref, updated)
+        return updated
+
+    run_transaction = getattr(client, "run_transaction", None)
+    if run_transaction is not None:
+        return run_transaction(_body)
+    return firestore.transactional(_body)(client.transaction())
+
+
 def update_membership_role(acting_user_id: str, org_id: str, target_user_id: str, role: str) -> dict:
     """Admin-only. Re-checks the acting user's role against a live
     Membership row rather than trusting the caller's session claims -
@@ -968,16 +1059,14 @@ def update_membership_role(acting_user_id: str, org_id: str, target_user_id: str
     org at all."""
     _require_admin(acting_user_id, org_id)
     membership_id = _membership_id(target_user_id, org_id)
-    doc_ref = _client().collection(_MEMBERSHIPS_ROOT).document(membership_id)
-    snap = doc_ref.get(timeout=_OP_TIMEOUT_SECONDS)
-    if not snap.exists:
-        raise ValueError(f"no such membership: {target_user_id} in {org_id}")
-    data = snap.to_dict()
-    if data.get("role") == "admin" and role != "admin" and _count_active_admins(org_id) <= 1:
-        raise LastAdminError(f"{org_id} would have zero admins left")
-    data["role"] = role
-    doc_ref.set(data, timeout=_OP_TIMEOUT_SECONDS)
-    return data
+
+    def _mutate(data: dict, active_admin_count: int) -> dict:
+        if data.get("role") == "admin" and role != "admin" and active_admin_count <= 1:
+            raise LastAdminError(f"{org_id} would have zero admins left")
+        data["role"] = role
+        return data
+
+    return _last_admin_guarded_update(org_id, membership_id, target_user_id, _mutate)
 
 
 def revoke_membership(acting_user_id: str, org_id: str, target_user_id: str) -> None:
@@ -986,15 +1075,14 @@ def revoke_membership(acting_user_id: str, org_id: str, target_user_id: str) -> 
     audit-relevant fact. Same last-admin guard as update_membership_role."""
     _require_admin(acting_user_id, org_id)
     membership_id = _membership_id(target_user_id, org_id)
-    doc_ref = _client().collection(_MEMBERSHIPS_ROOT).document(membership_id)
-    snap = doc_ref.get(timeout=_OP_TIMEOUT_SECONDS)
-    if not snap.exists:
-        raise ValueError(f"no such membership: {target_user_id} in {org_id}")
-    data = snap.to_dict()
-    if data.get("role") == "admin" and data.get("status") == "active" and _count_active_admins(org_id) <= 1:
-        raise LastAdminError(f"{org_id} would have zero admins left")
-    data["status"] = "revoked"
-    doc_ref.set(data, timeout=_OP_TIMEOUT_SECONDS)
+
+    def _mutate(data: dict, active_admin_count: int) -> dict:
+        if data.get("role") == "admin" and data.get("status") == "active" and active_admin_count <= 1:
+            raise LastAdminError(f"{org_id} would have zero admins left")
+        data["status"] = "revoked"
+        return data
+
+    _last_admin_guarded_update(org_id, membership_id, target_user_id, _mutate)
 
 
 def create_invitation(acting_user_id: str, org_id: str, email: str, role: str) -> tuple[dict, str]:

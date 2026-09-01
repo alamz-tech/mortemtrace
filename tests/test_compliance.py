@@ -150,6 +150,33 @@ def test_data_touched_true_produces_gdpr_draft_and_72h_clock(fake_db, monkeypatc
     assert draft_deadline == deadline
 
 
+def test_redelivery_of_the_same_run_does_not_duplicate_the_draft_or_reset_the_clock(fake_db, monkeypatch):
+    """Regression, more consequential than a duplicate draft alone: the
+    GDPR clock document is keyed by incident_id and was previously
+    overwritten unconditionally on every incident.classified dispatch. A
+    redelivery (timeline.committed's six-way fan-out can outrun Pub/Sub's
+    ack deadline; Classifier republishing incident.classified on its own
+    redelivery is the other path in) would silently push the 72-hour
+    deadline forward to a later now(), not just add a second draft."""
+    _seed_compliance_agent(fake_db)
+    _seed_classification(fake_db, data_touched=True)
+    stub_gateway(monkeypatch, text=json.dumps({
+        "body": "Email addresses and billing addresses for affected customers appeared in application logs.",
+    }))
+    envelope = _envelope_incident_classified(data_touched=True)
+
+    first = compliance.run(_claim(), envelope)
+    first_deadline = _clocks(fake_db)[0]["deadline_at"]
+    second = compliance.run(_claim(), envelope)
+
+    assert first.status == "ok"
+    assert second.status == "ok"
+    assert len(_drafts(fake_db)) == 1
+    clocks = _clocks(fake_db)
+    assert len(clocks) == 1
+    assert clocks[0]["deadline_at"] == first_deadline
+
+
 def test_data_touched_false_writes_no_artifacts(fake_db, monkeypatch):
     _seed_compliance_agent(fake_db)
     _seed_classification(fake_db, data_touched=False)

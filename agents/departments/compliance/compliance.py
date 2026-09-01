@@ -115,6 +115,24 @@ def _on_incident_classified(claim: OrgClaim, incident_id: str) -> RunResult:
                           detail=f"gdpr assessment output failed schema validation: {exc}",
                           turns=result.turns, tokens_used=result.tokens_used)
 
+    # Claimed after the model call, not before - see
+    # scope_store.claim_idempotency_key's docstring. Gates BOTH writes
+    # below together: a redelivered incident.classified must skip the
+    # clock too, not just dedup the draft while silently re-stamping the
+    # 72-hour deadline forward on every redelivery (clock.write() below is
+    # keyed by incident_id and would otherwise blindly overwrite an
+    # earlier, real deadline with a later now()).
+    if not scope_store.claim_idempotency_key(
+        claim, Collection.DRAFTS, f"compliance:{claim.run_id}:{incident_id}",
+    ):
+        logger.info(
+            "compliance: run %s for incident %s already produced a GDPR "
+            "assessment (likely a Pub/Sub redelivery) - not writing a "
+            "duplicate draft or resetting the clock",
+            claim.run_id, incident_id,
+        )
+        return RunResult(status="ok", turns=result.turns, tokens_used=result.tokens_used)
+
     # Single now() call: the clock's deadline and the draft's mirrored
     # clock_deadline_at must agree to the microsecond, and two separate
     # now() calls would not.

@@ -89,6 +89,34 @@ def test_diagnosis_happy_path_writes_hypothesis_with_resolved_source(fake_db, mo
     assert written[0]["source_event_ids"] == ["evt_1"]
 
 
+def test_diagnosis_redelivery_of_the_same_run_does_not_write_a_second_hypothesis(fake_db, monkeypatch):
+    """Regression: timeline.committed's six-way departmental fan-out can
+    outrun Pub/Sub's ack deadline and get redelivered
+    (agents/coordinator/coordinator.py's _dispatch_concurrently docstring).
+    Before the idempotency guard, calling run() again with the SAME
+    run_id/incident_id (what a redelivery looks like from Diagnosis' own
+    perspective - a fresh dispatch, identical envelope) wrote a second,
+    independent Hypothesis with its own new_id()."""
+    _seed_diagnosis_agent(fake_db)
+    _seed_timeline(fake_db)
+    monkeypatch.setattr(
+        "gateway.agent_gateway.invoke",
+        lambda agent, prompt, **kw: agent_gateway.InvokeResult(
+            text='{"statement": "pods OOM-killed under load", "confidence": 0.8, '
+                 '"source_entry_indices": [0], "prior_incident_refs": []}',
+            tokens_used=80, turns=1,
+        ),
+    )
+    envelope = _envelope()
+
+    first = diagnosis.run(_claim(), envelope)
+    second = diagnosis.run(_claim(), envelope)
+
+    assert first.status == "ok"
+    assert second.status == "ok"
+    assert len(_hypotheses(fake_db)) == 1
+
+
 def test_diagnosis_flattens_multiple_cited_entries(fake_db, monkeypatch):
     _seed_diagnosis_agent(fake_db)
     _seed_timeline(fake_db)

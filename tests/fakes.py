@@ -140,7 +140,11 @@ class _Query:
         return _Query(self._store, self._path, self._filters, self._limit,
                       self._order_by + [(field, direction)])
 
-    def stream(self, timeout: Optional[float] = None):
+    def stream(self, transaction: Any = None, timeout: Optional[float] = None):
+        # `transaction` is accepted, not applied specially: run_transaction()
+        # already holds _txn_lock for the whole body, so a query issued
+        # inside a transaction already sees a consistent snapshot relative
+        # to every other transaction, the same way _DocRef.get() does.
         prefix_len = len(self._path) + 1
         results = []
         for path, data in list(self._store._docs.items()):

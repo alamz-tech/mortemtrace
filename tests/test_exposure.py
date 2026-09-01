@@ -163,6 +163,26 @@ def test_exposure_figure_traceable_to_downtime_and_sla_terms(fake_db, monkeypatc
     assert draft["exposure_by_customer"]["cust_affected"] == 128.0
 
 
+def test_redelivery_of_the_same_run_does_not_write_a_second_draft(fake_db, monkeypatch):
+    """Regression: timeline.committed's six-way departmental fan-out can
+    outrun Pub/Sub's ack deadline and get redelivered
+    (agents/coordinator/coordinator.py's _dispatch_concurrently docstring).
+    A second dispatch with the SAME run_id/incident_id must not write a
+    second, independent draft."""
+    _seed_exposure_agent(fake_db)
+    _seed_classification(fake_db)
+    _seed_customers(fake_db)
+    stub_gateway(monkeypatch, text=json.dumps({"body": "x"}))
+    envelope = _envelope()
+
+    first = exposure.run(_claim(), envelope)
+    second = exposure.run(_claim(), envelope)
+
+    assert first.status == "ok"
+    assert second.status == "ok"
+    assert len(_drafts(fake_db)) == 1
+
+
 def test_model_armor_block_returns_blocked_and_writes_nothing(fake_db, monkeypatch):
     _seed_exposure_agent(fake_db)
     _seed_classification(fake_db)

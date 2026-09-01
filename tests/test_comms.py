@@ -140,6 +140,27 @@ def test_happy_path_writes_status_update_draft_from_timeline_only(fake_db, monke
     assert draft["source_refs"] == ["evt_1", "evt_2"]  # timeline's own source_event_ids, nothing else
 
 
+def test_redelivery_of_the_same_run_does_not_write_a_second_draft(fake_db, monkeypatch):
+    """Regression: timeline.committed's six-way departmental fan-out can
+    outrun Pub/Sub's ack deadline and get redelivered
+    (agents/coordinator/coordinator.py's _dispatch_concurrently docstring).
+    A second dispatch with the SAME run_id/incident_id must not write a
+    second, independent draft."""
+    _seed_comms_agent(fake_db)
+    _seed_timeline(fake_db)
+    stub_gateway(monkeypatch, text=json.dumps({
+        "body": "We experienced elevated checkout latency; service has recovered.",
+    }))
+    envelope = _envelope()
+
+    first = comms.run(_claim(), envelope)
+    second = comms.run(_claim(), envelope)
+
+    assert first.status == "ok"
+    assert second.status == "ok"
+    assert len(_drafts(fake_db)) == 1
+
+
 def test_model_armor_block_returns_blocked_and_writes_nothing(fake_db, monkeypatch):
     _seed_comms_agent(fake_db)
     _seed_timeline(fake_db)

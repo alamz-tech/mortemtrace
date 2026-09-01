@@ -110,6 +110,26 @@ def run(claim: OrgClaim, envelope: Envelope) -> RunResult:
             tokens_used=invoked.tokens_used, turns=invoked.turns,
         )
 
+    # Claimed after the model call, not before - see
+    # scope_store.claim_idempotency_key's docstring. Classification is
+    # keyed by incident_id and would otherwise silently overwrite itself
+    # on a redelivered timeline.committed - and since the model call isn't
+    # pinned to temperature 0, a redelivery could overwrite a real
+    # data_touched=true verdict with a different one, silently flipping
+    # whether Compliance's GDPR clock ever starts. This also prevents
+    # re-publishing incident.classified, which would otherwise re-trigger
+    # Compliance's real (also now-guarded, but no need to rely on that
+    # here too) GDPR work a second time.
+    if not scope_store.claim_idempotency_key(
+        claim, Collection.CLASSIFICATION, f"classifier:{claim.run_id}:{incident_id}",
+    ):
+        logger.info(
+            "classifier: run %s for incident %s was already classified "
+            "(likely a Pub/Sub redelivery) - not overwriting it",
+            claim.run_id, incident_id,
+        )
+        return RunResult(status="ok", tokens_used=invoked.tokens_used, turns=invoked.turns)
+
     classification = Classification(
         incident_id=incident_id,
         org_id=claim.org_id,
