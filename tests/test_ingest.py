@@ -383,6 +383,27 @@ def test_ingest_rate_limits_repeated_calls(client, published, monkeypatch):
     assert codes[2:] == [429, 429]
 
 
+def test_webhook_pre_lookup_rate_limit_fires_before_the_firestore_read(client, monkeypatch):
+    """Regression, found in a security self-review: connector_registry.
+    load() is a real Firestore read that ran with NO rate limit at all -
+    _WEBHOOK_LIMITER is keyed by config.org_id, which doesn't exist until
+    AFTER that read succeeds. Proven here with a connector_id that is
+    format-valid but never registered: if the limiter only ran after the
+    lookup (the old, broken order), every one of these would 404, never
+    429 - so seeing 429 here is the actual proof the check now runs
+    first, not just that a 429 exists somewhere in the response space."""
+    monkeypatch.setattr(ingest_module, "_PRE_LOOKUP_WEBHOOK_LIMITER",
+                        identity.TokenBucketLimiter(capacity=2, refill_per_second=0.0))
+
+    codes = [
+        client.post("/webhook/conn_deadbeef0000", content=b'{"a":1}').status_code
+        for _ in range(4)
+    ]
+
+    assert codes[:2] == [404, 404]  # connector genuinely doesn't exist - correct, once past the limiter
+    assert codes[2:] == [429, 429]  # limiter now fires BEFORE the lookup gets a chance to 404 again
+
+
 def test_watcher_sweep_without_credential_is_rejected():
     resp = TestClient(ingest_module.app).post("/watcher/sweep", json={})
     assert resp.status_code == 401

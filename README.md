@@ -4,8 +4,8 @@ An on-call incident agent fleet. One committed incident timeline, eleven agents,
 departmental read scopes enforced at the data layer — not in a prompt.
 
 Built for the Google **All Things Agentic Hackathon**, category **Fortified Enterprise
-Fleet**, by Alamz Tech. Full problem statement and requirements: [SPEC-postmortem.md](SPEC-postmortem.md).
-Architecture and trade-offs: [ARCHITECTURE.md](ARCHITECTURE.md) ([diagram](docs/architecture.mermaid)).
+Fleet**, by Alamz Tech. Architecture and trade-offs: [ARCHITECTURE.md](ARCHITECTURE.md)
+([diagram](docs/architecture.mermaid)).
 
 ## Try it live (judges start here)
 

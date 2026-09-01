@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import console.ui as console_module
-from auth import oidc
+from auth import identity, oidc
 from data.models import Collection
 from tests.conftest import (
     OTHER_ORG,
@@ -494,6 +494,44 @@ def test_login_org_with_unconfigured_domain_redirects_with_error(fake_db):
     )
     assert resp.status_code == 303
     assert resp.headers["location"].startswith("/login?error=")
+
+
+def test_auth_login_org_is_rate_limited(fake_db, monkeypatch):
+    """Regression, found in a security self-review: this route does a
+    full Firestore collection scan (find_organization_by_sso_domain_hint)
+    and is reachable with NO credential at all - _CONSOLE_LIMITER only
+    applies AFTER authentication succeeds, so this was unlimited by
+    construction. Verified against the real limiter, not a mock."""
+    monkeypatch.setattr(console_module, "_PRE_AUTH_LIMITER",
+                        identity.TokenBucketLimiter(capacity=2, refill_per_second=0.0))
+    client = TestClient(console_module.app)
+
+    codes = [
+        client.post(
+            "/auth/login/org", data={"email": "x@no-such-company.example"}, follow_redirects=False,
+        ).status_code
+        for _ in range(4)
+    ]
+
+    assert codes[:2] == [303, 303]
+    assert codes[2:] == [429, 429]
+
+
+def test_invite_redemption_entry_is_rate_limited(fake_db, monkeypatch):
+    """Same gap, the other pre-auth route: find_invitation_by_token is
+    also a full collection scan plus a digest computation per document,
+    reachable before any credential check."""
+    monkeypatch.setattr(console_module, "_PRE_AUTH_LIMITER",
+                        identity.TokenBucketLimiter(capacity=2, refill_per_second=0.0))
+    client = TestClient(console_module.app)
+
+    codes = [
+        client.get("/invite/not-a-real-token", follow_redirects=False).status_code
+        for _ in range(4)
+    ]
+
+    assert codes[:2] == [303, 303]
+    assert codes[2:] == [429, 429]
 
 
 def test_oidc_callback_sets_a_hardened_session_cookie(fake_db, monkeypatch):

@@ -187,7 +187,7 @@ the system's exposure, not just its behaviour.
 | `MORTEMTRACE_ALLOW_ANONYMOUS_DEMO` | `0` (closed) | `1` serves unauthenticated callers as `MORTEMTRACE_DEMO_ORG`. Demo only. Warns at startup. |
 | `MORTEMTRACE_PLATFORM_ORG` | unset (permissive) | Restricts registry writes to one org. Unset ⇒ any tenant with registry write scope can alter agent definitions for every tenant; warns. |
 | `MORTEMTRACE_INSECURE_COOKIES` | unset | `1` drops the `Secure` flag on the session cookie. Local HTTP development only. |
-| `MORTEMTRACE_TRUSTED_PROXY_HOPS` | `1` | How many proxies in front of this service append to `X-Forwarded-For`. Only affects connectors using the `ip_allowlist` strategy. `1` is correct for Cloud Run (one Google front end); add one for a custom load balancer in front of it. A wrong value fails closed rather than trusting a caller-supplied address — see `connectors/verification.py:_client_address`. |
+| `MORTEMTRACE_TRUSTED_PROXY_HOPS` | `1` | How many proxies in front of this service append to `X-Forwarded-For`. Used by every IP-based decision in the codebase — connectors' `ip_allowlist` strategy and the pre-auth rate limiters above. `1` is correct for Cloud Run (one Google front end); add one for a custom load balancer in front of it. A wrong value fails closed rather than trusting a caller-supplied address — see `auth/identity.py:resolve_client_address`. |
 | `MORTEMTRACE_SESSION_MAX_AGE` | `43200` (12h) | Console session cookie lifetime, seconds. |
 | `MORTEMTRACE_AUDIT_RETENTION_DAYS` | `400` | Audit TTL. Requires the TTL policy above to be enabled to take effect. |
 
@@ -199,6 +199,7 @@ Per-instance, not global (Cloud Run runs many instances — see `auth/identity.p
 |---|---|
 | `MORTEMTRACE_INGEST_BURST` / `MORTEMTRACE_INGEST_PER_MINUTE` | `20` / `60` |
 | `MORTEMTRACE_CONSOLE_BURST` / `MORTEMTRACE_CONSOLE_PER_MINUTE` | `120` / `600` |
+| `MORTEMTRACE_PRE_AUTH_BURST` / `MORTEMTRACE_PRE_AUTH_PER_MINUTE` | `20` / `60` | IP-keyed, not org-keyed — covers routes reachable before any credential check (Home Realm Discovery, invite-link redemption, the webhook connector lookup before it knows which connector's own limit applies). No tenant identity exists yet at this point, so this is the only pre-auth backstop these routes have. |
 
 ### Tuning and models
 
