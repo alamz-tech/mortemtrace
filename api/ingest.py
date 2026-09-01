@@ -203,6 +203,17 @@ def _route_sync(topic: str, payload: dict) -> None:
 _PUBSUB_CLIENT: Optional[pubsub_v1.PublisherClient] = None
 _PUBSUB_CLIENT_LOCK = threading.Lock()
 
+# Reused, not built per request: a ThreadPoolExecutor spins up its worker
+# threads on construction, so creating and joining a fresh one on every
+# new-incident /ingest call added real per-request overhead this file
+# already went to some trouble to eliminate elsewhere (see
+# _pubsub_client's own docstring on caching the gRPC client instead of
+# rebuilding it per call). max_workers=2 matches the two tasks actually
+# submitted below (_write_incident, _write_raw_evidence); a shared pool
+# this small easily keeps up since each task holds a worker only for one
+# Firestore write.
+_INGEST_WRITE_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="ingest-write")
+
 
 def _pubsub_client() -> pubsub_v1.PublisherClient:
     """Cached, not constructed per call. This used to be a fresh
@@ -378,10 +389,12 @@ def _handle_ingest(org_id: str, kind: EvidenceKind, incident_id: Optional[str], 
         # existence check on a caller-supplied incident_id - staying under
         # budget matters more than validating it before handing off to Intake.
         if creating_incident:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                futures = [pool.submit(_write_incident), pool.submit(_write_raw_evidence)]
-                for future in futures:
-                    future.result()
+            futures = [
+                _INGEST_WRITE_POOL.submit(_write_incident),
+                _INGEST_WRITE_POOL.submit(_write_raw_evidence),
+            ]
+            for future in futures:
+                future.result()
         else:
             _write_raw_evidence()
 

@@ -51,6 +51,18 @@ Source = Literal["model_armor", "local_fallback", "model_armor+local_fallback"]
 _TEMPLATE_ID = os.environ.get("MODEL_ARMOR_TEMPLATE_ID", "mortemtrace-guardian")
 _LOCATION = os.environ.get("MODEL_ARMOR_LOCATION", "us-central1")
 
+# Every Firestore call in this codebase is explicitly bounded
+# (data/scope_store.py's _OP_TIMEOUT_SECONDS) for exactly the same reason
+# this is: an unbounded gRPC call lets a hung backend hold a Cloud Run
+# request until the platform's own 300s ceiling. These two calls run on
+# every single model turn in every dispatch, so a hung Model Armor
+# backend compounds the ack-deadline risk documented on
+# coordinator._dispatch_concurrently - both are wrapped in a broad
+# `except Exception` already, so a timeout here degrades to the local
+# fallback screener exactly like any other Model Armor failure, not a new
+# failure mode.
+_ARMOR_TIMEOUT_SECONDS = float(os.environ.get("MODEL_ARMOR_TIMEOUT", "10"))
+
 
 class ArmorResult(BaseModel):
     verdict: Verdict
@@ -184,7 +196,7 @@ def screen_input(text: str, *, run_id: str, org_id: str, agent_name: str) -> Arm
             name=_template_name(),
             user_prompt_data=modelarmor_v1beta.DataItem(text=text),
         )
-        response = client.sanitize_user_prompt(request=request)
+        response = client.sanitize_user_prompt(request=request, timeout=_ARMOR_TIMEOUT_SECONDS)
         remote = _interpret(response.sanitization_result, text, is_input=True)
     except ModelArmorNotConfigured as exc:
         logger.error(
@@ -227,7 +239,7 @@ def screen_output(text: str, *, run_id: str, org_id: str, agent_name: str) -> Ar
             name=_template_name(),
             model_response_data=modelarmor_v1beta.DataItem(text=text),
         )
-        response = client.sanitize_model_response(request=request)
+        response = client.sanitize_model_response(request=request, timeout=_ARMOR_TIMEOUT_SECONDS)
         remote = _interpret(response.sanitization_result, text, is_input=False)
     except ModelArmorNotConfigured as exc:
         logger.error(
