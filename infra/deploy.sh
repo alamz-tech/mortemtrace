@@ -56,6 +56,14 @@
 # tell every service "Google Sign-In is configured" with a secret that
 # cannot authenticate anyone. See infra/README.md's "Google Sign-In
 # setup" section for the one-time manual Google Cloud Console steps.
+#
+# SERVICE ACCOUNTS: each service runs as its OWN dedicated runtime
+# service account, not the default Compute Engine one - which carries
+# roles/editor, project-wide, effectively admin over Firestore, Pub/Sub,
+# IAM, GCS, and Cloud Build. Found in a security self-review: neither
+# service needs anything close to that. Run infra/create_service_
+# accounts.sh once before the first deploy that uses this; this script
+# fails its own precondition check below if that hasn't happened yet.
 set -euo pipefail
 
 PROJECT="${GOOGLE_CLOUD_PROJECT:?set GOOGLE_CLOUD_PROJECT}"
@@ -71,6 +79,10 @@ OIDC_CLIENT_SECRETS_NAME="${MORTEMTRACE_OIDC_CLIENT_SECRETS_NAME:-mortemtrace-oi
 GOOGLE_OAUTH_SECRET_NAME="${MORTEMTRACE_GOOGLE_OAUTH_SECRET_NAME:-mortemtrace-google-oauth-client-secret}"
 GOOGLE_OAUTH_PLACEHOLDER="unset-see-infra-README-google-sign-in-setup"
 PUSHER_EMAIL="mortemtrace-pubsub-pusher@${PROJECT}.iam.gserviceaccount.com"
+INGEST_SA_NAME="${MORTEMTRACE_INGEST_SA_NAME:-mortemtrace-ingest-runtime}"
+CONSOLE_SA_NAME="${MORTEMTRACE_CONSOLE_SA_NAME:-mortemtrace-console-runtime}"
+INGEST_SA_EMAIL="${INGEST_SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
+CONSOLE_SA_EMAIL="${CONSOLE_SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
 
 # Anonymous demo mode is OFF unless explicitly requested. Default-closed
 # is the whole point: with it off and no tokens configured, the services
@@ -96,6 +108,17 @@ require_secret "${SESSION_SECRET_NAME}"
 require_secret "${TOKENS_SECRET_NAME}"
 require_secret "${CONNECTOR_SECRETS_NAME}"
 require_secret "${OIDC_CLIENT_SECRETS_NAME}"
+
+require_service_account() {
+  local email="$1"
+  if ! gcloud iam service-accounts describe "${email}" --project "${PROJECT}" >/dev/null 2>&1; then
+    echo "Missing runtime service account '${email}'." >&2
+    echo "Create it first:  GOOGLE_CLOUD_PROJECT=${PROJECT} bash infra/create_service_accounts.sh" >&2
+    exit 1
+  fi
+}
+require_service_account "${INGEST_SA_EMAIL}"
+require_service_account "${CONSOLE_SA_EMAIL}"
 
 COMMON_SECRETS="MORTEMTRACE_CLAIM_SECRET=${CLAIM_SECRET_NAME}:latest,MORTEMTRACE_SESSION_SECRET=${SESSION_SECRET_NAME}:latest,MORTEMTRACE_API_TOKENS=${TOKENS_SECRET_NAME}:latest,MORTEMTRACE_CONNECTOR_SECRETS=${CONNECTOR_SECRETS_NAME}:latest,MORTEMTRACE_OIDC_CLIENT_SECRETS=${OIDC_CLIENT_SECRETS_NAME}:latest"
 
@@ -142,6 +165,7 @@ deploy_ingest() {
     --source . \
     --project "${PROJECT}" \
     --region "${REGION}" \
+    --service-account "${INGEST_SA_EMAIL}" \
     --allow-unauthenticated \
     --min-instances 0 \
     --max-instances "${MORTEMTRACE_MAX_INSTANCES:-10}" \
@@ -168,6 +192,7 @@ gcloud run deploy mortemtrace-console \
   --source . \
   --project "${PROJECT}" \
   --region "${REGION}" \
+  --service-account "${CONSOLE_SA_EMAIL}" \
   --allow-unauthenticated \
   --min-instances 0 \
   --max-instances "${MORTEMTRACE_MAX_INSTANCES:-10}" \
